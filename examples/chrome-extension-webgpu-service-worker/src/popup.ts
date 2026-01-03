@@ -48,8 +48,8 @@ const initProgressCallback = (report: InitProgressReport) => {
 };
 
 const engine: MLCEngineInterface = await CreateExtensionServiceWorkerMLCEngine(
-  "Qwen2-0.5B-Instruct-q4f16_1-MLC",
-  { initProgressCallback: initProgressCallback },
+  "Llama-3.2-3B-Instruct-q4f32_1-MLC",
+  { initProgressCallback: initProgressCallback }
 );
 const chatHistory: ChatCompletionMessageParam[] = [];
 
@@ -154,7 +154,10 @@ function fetchPageContents() {
     const allTabContents: { title: string; url: string; content: string }[] = [];
     let completedTabs = 0;
     
-    if (tabs.length === 0) return;
+    if (tabs.length === 0) {
+      console.warn("⚠️ No tabs found in current window");
+      return;
+    }
     
     tabs.forEach((tab) => {
       if (tab.id) {
@@ -191,19 +194,26 @@ function fetchPageContents() {
             }
           });
           
-          // Handle connection errors (e.g., for chrome:// pages or pages without content script)
+          // Handle connection errors (e.g., for chrome:// pages, pages without content script, or stale content scripts after extension reload)
           port.onDisconnect.addListener(() => {
+            if (chrome.runtime.lastError) {
+              // Suppress the error and show a warning instead
+              console.warn(`⚠️ Could not connect to tab ${tab.id} (${tab.title || 'Untitled'}): ${chrome.runtime.lastError.message}. This may happen if the extension was recently reloaded - please refresh the page to enable content extraction.`);
+            }
             completedTabs++;
-            if (completedTabs === tabs.length && chatHistory.length === 0 && pageContext) {
-              chatHistory.push({
-                role: "system",
-                content: `You are a helpful assistant. Here is the content of all ${allTabContents.length} accessible tabs currently open in the browser:\n\n${pageContext}\n\nPlease answer questions about these webpages based on the content provided above.`
-              });
-              // console.log("content",pageContext);
+            if (completedTabs === tabs.length) {
+              if (allTabContents.length === 0) {
+                console.warn("⚠️ No tab content was retrieved. If you recently reloaded the extension, please refresh your browser tabs to enable content extraction.");
+              } else if (chatHistory.length === 0 && pageContext) {
+                chatHistory.push({
+                  role: "system",
+                  content: `You are a helpful assistant. Here is the content of all ${allTabContents.length} accessible tabs currently open in the browser:\n\n${pageContext}\n\nPlease answer questions about these webpages based on the content provided above.`
+                });
+              }
             }
           });
         } catch (error) {
-          console.error(`Failed to connect to tab ${tab.id}:`, error);
+          console.warn(`⚠️ Failed to connect to tab ${tab.id} (${tab.title || 'Untitled'}): ${error instanceof Error ? error.message : String(error)}. This may happen if the extension was recently reloaded - please refresh the page.`);
           completedTabs++;
         }
       } else {
