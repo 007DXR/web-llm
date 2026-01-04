@@ -52,7 +52,7 @@ const engine: MLCEngineInterface = await CreateExtensionServiceWorkerMLCEngine(
   "Llama-3.2-3B-Instruct-q4f32_1-MLC",
   { initProgressCallback: initProgressCallback }
 );
-const chatHistory: ChatCompletionMessageParam[] = [];
+
 
 isLoadingParams = true;
 
@@ -88,7 +88,6 @@ queryInput.addEventListener("keyup", (event) => {
 
 // Listen for clicks on submit button
 async function handleClick() {
-  fetchPageContents()
   // Get the message from the input field
   const message = (<HTMLInputElement>queryInput).value;
   console.log("message", message);
@@ -99,7 +98,7 @@ async function handleClick() {
   document.getElementById("answerWrapper")!.style.display = "none";
   // Show the loading indicator
   document.getElementById("loading-indicator")!.style.display = "block";
-
+  let chatHistory: ChatCompletionMessageParam[] = [];
   let finalMessages: ChatCompletionMessageParam[] = [];
 
   // Check if we have multiple tabs
@@ -117,15 +116,14 @@ async function handleClick() {
       const compressionMessages: ChatCompletionMessageParam[] = [
         {
           role: "system",
-          content: `You are an information extraction expert.  Your task is to read the provided web page content and extract ONLY the information that is relevant to the user's question. If no relevant information, say "no relevant information"`
+          content: "Extract facts from the provided content that answer the question. Format: Concise bullet points. If missing, say 'No relevant information'. No conversational filler."
         },
         {
           role: "user",
-          content: `QUESTION: "${message}"
-SOURCE: [${tabInfo.title}](${tabInfo.url})
-CONTENT: 
-${tabInfo.content}
-Extracted relevant info:`}
+          content: `CONTEXT: ${tabInfo.content}
+      QUESTION: ${message}
+      RESULT:`
+        }
       ];
 
       // Get compressed content from the engine
@@ -154,6 +152,7 @@ Extracted relevant info:`}
     // Phase 2: Combine all compressed contents and generate final answer
     const combinedCompressedContext = compressedTabContents
       .map((tabInfo, index) =>
+        // `[${tabInfo.title}](${tabInfo.url}):${tabInfo.compressed}\n`
         `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nRelevant Information: ${tabInfo.compressed}\n`
       )
       .join("\n");
@@ -177,6 +176,7 @@ Extracted relevant info:`}
     // Combine all tab contents into a single context (for single-tab fallback)
     pageContext = allTabContents
       .map((tabInfo, index) =>
+        // `[${tabInfo.title}](${tabInfo.url}):${tabInfo.content}\n`
         `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\n\n${tabInfo.content}\n\n`
       )
       .join("\n");
@@ -209,13 +209,8 @@ Extracted relevant info:`}
   }
 
   // Update chat history
-  if (allTabContents.length > 1) {
-    // For multi-tab scenario, store the compressed conversation
-    chatHistory.push({ role: "assistant", content: await engine.getMessage() });
-  } else {
-
-    chatHistory.push({ role: "assistant", content: await engine.getMessage() });
-  }
+  chatHistory.push({ role: "assistant", content: await engine.getMessage() });
+ 
 }
 
 submitButton.addEventListener("click", handleClick);
@@ -272,49 +267,35 @@ function fetchPageContents() {
               content: msg.contents
             });
 
-
+            console.log(msg.contents)
           });
-
-          // // Handle connection errors (e.g., for chrome:// pages, pages without content script, or stale content scripts after extension reload)
-          // port.onDisconnect.addListener(() => {
-          //   if (chrome.runtime.lastError) {
-          //     // Suppress the error and show a warning instead
-          //     console.warn(`⚠️ Could not connect to tab ${tab.id} (${tab.title || 'Untitled'}): ${chrome.runtime.lastError.message}. This may happen if the extension was recently reloaded - please refresh the page to enable content extraction.`);
-          //   }
-          //   completedTabs++;
-          //   if (completedTabs === tabs.length) {
-          //     if (allTabContents.length === 0) {
-          //       console.warn("⚠️ No tab content was retrieved. If you recently reloaded the extension, please refresh your browser tabs to enable content extraction.");
-          //     } else if (chatHistory.length === 0 && pageContext && allTabContents.length === 1) {
-          //       chatHistory.push({
-          //         role: "system",
-          //         content: `You are a helpful assistant. Here is the content of the accessible browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage based on the content provided above.`
-          //       });
-          //     }
-          //   }
-          // });
+          port.onDisconnect.addListener(() => {
+            if (chrome.runtime.lastError) {
+              // Suppress the error and show a warning instead
+              console.warn(`⚠️ Could not connect to tab ${tab.id} (${tab.title || 'Untitled'}): ${chrome.runtime.lastError.message}. This may happen if the extension was recently reloaded - please refresh the page to enable content extraction.`);
+            }
+          });
         } catch (error) {
           console.warn(`⚠️ Failed to connect to tab ${tab.id} (${tab.title || 'Untitled'}): ${error instanceof Error ? error.message : String(error)}. This may happen if the extension was recently reloaded - please refresh the page.`);
-          // completedTabs++;
         }
-      } else {
-        // completedTabs++;
       }
     });
   });
+  
 }
+
 
 // Grab the page contents when the popup is opened
 // Use DOMContentLoaded instead of window.onload to ensure it fires
-// if (document.readyState === 'loading') {
-//   document.addEventListener('DOMContentLoaded', function() {
-//     if (useContext) {
-//       fetchPageContents();
-//     }
-//   });
-// } else {
-//   // Document already loaded
-//   if (useContext) {
-//     fetchPageContents();
-//   }
-// }
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', function() {
+    if (useContext) {
+      fetchPageContents();
+    }
+  });
+} else {
+  // Document already loaded
+  if (useContext) {
+    fetchPageContents();
+  }
+}
