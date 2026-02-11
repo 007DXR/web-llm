@@ -1,38 +1,27 @@
 "use strict";
 
+/**
+ * Popup - 用户界面层
+ * 
+ * 职责：
+ * - 用户输入/输出
+ * - 通过 Background 控制平面发送请求
+ * - 接收 Streaming 响应并渲染
+ */
+
 // This code is partially adapted from the openai-chatgpt-chrome-extension repo:
 // https://github.com/jessedi0n/openai-chatgpt-chrome-extension
 
 import "./popup.css";
-
-import {
-  ChatCompletionMessageParam,
-  CreateExtensionServiceWorkerMLCEngine,
-  MLCEngineInterface,
-  InitProgressReport,
-} from "@mlc-ai/web-llm";
 import { ProgressBar, Line } from "progressbar.js";
 
-/***************** UI elements *****************/
-// Whether or not to use the content from the active tab as the context
-const useContext = true;
-console.log('useContext value:', useContext);
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// ==================== 类型定义 ====================
 
-const queryInput = document.getElementById("query-input")!;
-const submitButton = document.getElementById("submit-button")!;
+interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
 
-let isLoadingParams = false;
-let pageContext = ""; // Store the page context
-let allTabContents: { 
-  title: string; 
-  url: string; 
-  content: string; 
-  cachedSummary?: string; 
-  hasCachedSummary: boolean; 
-}[] = []; // Store individual tab contents with cached summary info
-
-// Type for cached summary data
 interface CachedSummaryData {
   url: string;
   title: string;
@@ -41,7 +30,33 @@ interface CachedSummaryData {
   contentLength: number;
 }
 
-(<HTMLButtonElement>submitButton).disabled = true;
+interface TabContent {
+  title: string;
+  url: string;
+  content: string;
+  cachedSummary?: string;
+  hasCachedSummary: boolean;
+}
+
+interface StreamChunk {
+  requestId: string;
+  chunk?: string;
+  done?: boolean;
+  error?: string;
+  usage?: any;
+}
+
+// ==================== 配置 ====================
+
+const useContext = true;
+console.log("[Popup] useContext:", useContext);
+
+// ==================== UI 元素 ====================
+
+const queryInput = document.getElementById("query-input")! as HTMLInputElement;
+const submitButton = document.getElementById("submit-button")! as HTMLButtonElement;
+
+submitButton.disabled = true;
 
 const progressBar: ProgressBar = new Line("#loadingContainer", {
   strokeWidth: 4,
@@ -53,50 +68,132 @@ const progressBar: ProgressBar = new Line("#loadingContainer", {
   svgStyle: { width: "100%", height: "100%" },
 });
 
-/***************** Web-LLM MLCEngine Configuration *****************/
-const initProgressCallback = (report: InitProgressReport) => {
-  progressBar.animate(report.progress, {
-    duration: 50,
+// ==================== 状态管理 ====================
+
+let isLoadingParams = true;
+let allTabContents: TabContent[] = [];
+
+// ==================== 引擎状态管理 ====================
+
+async function checkEngineStatus(): Promise<{ ready: boolean; progress: number }> {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "GET_ENGINE_STATUS" }, (response) => {
+      if (chrome.runtime.lastError) {
+        console.warn("[Popup] Error checking engine status:", chrome.runtime.lastError);
+        resolve({ ready: false, progress: 0 });
+      } else {
+        resolve(response || { ready: false, progress: 0 });
+      }
+    });
   });
-  if (report.progress == 1.0) {
-    enableInputs();
-  }
-};
+}
 
-const engine: MLCEngineInterface = await CreateExtensionServiceWorkerMLCEngine(
-      // "Llama-3.2-1B-Instruct-q4f16_1-MLC", 
-  // "Llama-3.2-3B-Instruct-q4f16_1-MLC",
-  // "Ministral-3-3B-Instruct-2512-BF16-q4f16_1-MLC",
-  "Phi-3-mini-4k-instruct-q4f16_1-MLC",
-  { initProgressCallback: initProgressCallback }
-);
+async function initializeEngine(): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "INIT_ENGINE_REQUEST" }, (response) => {
+      if (chrome.runtime.lastError) {
+        console.warn("[Popup] Error initializing engine:", chrome.runtime.lastError);
+      }
+      resolve();
+    });
+  });
+}
 
+// 轮询检查引擎状态
+async function waitForEngine(): Promise<void> {
+  const checkInterval = 500;
+  const maxWaitTime = 120000; // 2分钟超时
+  const startTime = Date.now();
 
-isLoadingParams = true;
+  // 先请求初始化
+  await initializeEngine();
+
+  return new Promise((resolve, reject) => {
+    const check = async () => {
+      const status = await checkEngineStatus();
+      
+      progressBar.animate(status.progress, { duration: 50 });
+      
+      if (status.ready) {
+        enableInputs();
+        resolve();
+      } else if (Date.now() - startTime > maxWaitTime) {
+        reject(new Error("Engine initialization timeout"));
+      } else {
+        setTimeout(check, checkInterval);
+      }
+    };
+    
+    check();
+  });
+}
 
 function enableInputs() {
   if (isLoadingParams) {
-    sleep(500);
-    (<HTMLButtonElement>submitButton).disabled = false;
-    const loadingBarContainer = document.getElementById("loadingContainer")!;
-    loadingBarContainer.remove();
+    submitButton.disabled = false;
+    const loadingBarContainer = document.getElementById("loadingContainer");
+    if (loadingBarContainer) {
+      loadingBarContainer.remove();
+    }
     queryInput.focus();
     isLoadingParams = false;
   }
 }
 
-/***************** Event Listeners *****************/
+// ==================== Streaming Chat ====================
 
-// Disable submit button if input field is empty
+async function sendStreamingChat(messages: ChatMessage[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const port = chrome.runtime.connect({ name: "chat_stream" });
+    let fullMessage = "";
+
+    port.onMessage.addListener((message) => {
+      if (message.type === "chunk") {
+        const chunk = message.data as StreamChunk;
+        
+        if (chunk.error) {
+          reject(new Error(chunk.error));
+          port.disconnect();
+          return;
+        }
+
+        if (chunk.chunk) {
+          fullMessage += chunk.chunk;
+          updateAnswer(fullMessage);
+        }
+
+        if (chunk.done) {
+          resolve(fullMessage);
+          port.disconnect();
+        }
+      } else if (message.type === "status") {
+        console.log("[Popup] Engine status:", message.status, message.progress);
+      } else if (message.type === "error") {
+        reject(new Error(message.error));
+        port.disconnect();
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      }
+    });
+
+    // 发送聊天请求
+    port.postMessage({
+      type: "CHAT_STREAM_START",
+      messages: messages
+    });
+  });
+}
+
+// ==================== 事件监听器 ====================
+
 queryInput.addEventListener("keyup", () => {
-  if ((<HTMLInputElement>queryInput).value === "") {
-    (<HTMLButtonElement>submitButton).disabled = true;
-  } else {
-    (<HTMLButtonElement>submitButton).disabled = false;
-  }
+  submitButton.disabled = queryInput.value === "";
 });
 
-// If user presses enter, click submit button
 queryInput.addEventListener("keyup", (event) => {
   if (event.code === "Enter") {
     event.preventDefault();
@@ -104,71 +201,48 @@ queryInput.addEventListener("keyup", (event) => {
   }
 });
 
-// Listen for clicks on submit button
+submitButton.addEventListener("click", handleClick);
+
+// ==================== 处理用户提交 ====================
+
 async function handleClick() {
-  // Get the message from the input field
-  const message = (<HTMLInputElement>queryInput).value;
-  console.log("message", message);
+  const message = queryInput.value;
+  console.log("[Popup] User message:", message);
 
-  // Clear the answer
+  // 重置 UI
   document.getElementById("answer")!.innerHTML = "";
-  // Hide the answer
   document.getElementById("answerWrapper")!.style.display = "none";
-  // Show the loading indicator
   document.getElementById("loading-indicator")!.style.display = "block";
-  let chatHistory: ChatCompletionMessageParam[] = [];
-  let finalMessages: ChatCompletionMessageParam[] = [];
 
-  // Check if we have multiple tabs
+  let finalMessages: ChatMessage[] = [];
+
+  // 检查是否有多个标签页
   if (allTabContents.length > 1) {
-    console.log(`Processing ${allTabContents.length} tabs with smart compression...`);
+    console.log(`[Popup] Processing ${allTabContents.length} tabs...`);
 
-    // Phase 1: For each tab, answer the question using summary or original content
-    const compressedTabContents: { title: string; url: string; compressed: string; isRelevant: boolean }[] = [];
-
-    // Helper function to answer question based on content
-    async function answerFromContent(content: string, question: string): Promise<string> {
-      const messages: ChatCompletionMessageParam[] = [
-        {
-          role: "system",
-          content: "Answer the question based on the provided content. Format: Concise bullet points. If the content doesn't contain relevant information, say 'No relevant information'. No conversational filler."
-        },
-        {
-          role: "user",
-          content: `CONTENT: ${content}\nQUESTION: ${question}\nANSWER:`
-        }
-      ];
-
-      let answer = "";
-      const completion = await engine.chat.completions.create({
-        stream: true,
-        messages: messages,
-      });
-
-      for await (const chunk of completion) {
-        const curDelta = chunk.choices[0].delta.content;
-        if (curDelta) {
-          answer += curDelta;
-        }
-      }
-      return answer;
-    }
+    // Phase 1: 对每个标签页，使用摘要或原始内容回答问题
+    const compressedTabContents: { 
+      title: string; 
+      url: string; 
+      compressed: string; 
+      isRelevant: boolean 
+    }[] = [];
 
     for (let i = 0; i < allTabContents.length; i++) {
       const tabInfo = allTabContents[i];
-      console.log(`Processing tab ${i + 1}/${allTabContents.length}: ${tabInfo.title} (has cached summary: ${tabInfo.hasCachedSummary})`);
+      console.log(`[Popup] Processing tab ${i + 1}/${allTabContents.length}: ${tabInfo.title}`);
 
       let compressedContent = "";
       let isRelevant = true;
 
       if (tabInfo.hasCachedSummary && tabInfo.cachedSummary) {
-        // Step 1: Try to answer using cached summary first
-        console.log(`Attempting to answer using cached summary for: ${tabInfo.title}; summary: ${tabInfo.cachedSummary}`);
+        // 使用缓存的摘要
+        console.log(`[Popup] Using cached summary for: ${tabInfo.title}`);
         
-        const summaryMessages: ChatCompletionMessageParam[] = [
+        const summaryMessages: ChatMessage[] = [
           {
             role: "system",
-            content: "Answer the question based on the summary. Output format:\nSUFFICIENT: yes/no (whether the summary has enough info to answer)\nANSWER: your answer here (or 'N/A' if not sufficient)\n\nBe concise. If the summary lacks necessary details, mark as not sufficient."
+            content: "Answer the question based on the summary. Output format:\nSUFFICIENT: yes/no\nANSWER: your answer here (or 'N/A' if not sufficient)\n\nBe concise."
           },
           {
             role: "user",
@@ -176,48 +250,36 @@ async function handleClick() {
           }
         ];
 
-        let summaryResponse = "";
-        const summaryCompletion = await engine.chat.completions.create({
-          stream: true,
-          messages: summaryMessages,
-        });
-
-        for await (const chunk of summaryCompletion) {
-          const curDelta = chunk.choices[0].delta.content;
-          if (curDelta) {
-            summaryResponse += curDelta;
+        try {
+          const summaryResponse = await sendStreamingChat(summaryMessages);
+          const isSufficient = summaryResponse.toLowerCase().includes("sufficient: yes");
+          
+          if (isSufficient) {
+            const answerMatch = summaryResponse.match(/ANSWER:\s*([\s\S]*)/i);
+            compressedContent = answerMatch ? answerMatch[1].trim() : summaryResponse;
+            isRelevant = !compressedContent.toLowerCase().includes("no relevant information") &&
+                         compressedContent.toLowerCase() !== "n/a";
+          } else {
+            // 摘要不够，使用原始内容
+            compressedContent = await answerFromContent(tabInfo.content, message);
+            isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
           }
-        }
-
-        console.log(`Summary-based answer for ${tabInfo.title}:`, summaryResponse);
-
-        // Check if the summary was sufficient to answer
-        const isSufficient = summaryResponse.toLowerCase().includes("sufficient: yes");
-        
-        if (isSufficient) {
-          // Extract the answer from the response
-          const answerMatch = summaryResponse.match(/ANSWER:\s*([\s\S]*)/i);
-          compressedContent = answerMatch ? answerMatch[1].trim() : summaryResponse;
-          console.log(`Summary sufficient for ${tabInfo.title}, using answer from summary`);
-          
-          // Check if the answer indicates no relevant info
-          isRelevant = !compressedContent.toLowerCase().includes("no relevant information") && 
-                       compressedContent.toLowerCase() !== "n/a";
-        } else {
-          // Summary not sufficient, need to answer from original content
-          console.log(`Summary not sufficient for ${tabInfo.title}, answering from original content:${tabInfo.content}`);
-          compressedContent = await answerFromContent(tabInfo.content, message);
-          
-          // Check if the answer indicates no relevant info
-          isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
+        } catch (err) {
+          console.error(`[Popup] Error processing tab ${tabInfo.title}:`, err);
+          compressedContent = "Error processing this tab";
+          isRelevant = false;
         }
       } else {
-        // No cached summary - answer directly from original content
-        console.log(`No cached summary for ${tabInfo.title}, answering from original content:${tabInfo.content}`);
-        compressedContent = await answerFromContent(tabInfo.content, message);
-        
-        // Check if the answer indicates no relevant info
-        isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
+        // 无缓存摘要，直接使用原始内容
+        console.log(`[Popup] No cached summary for: ${tabInfo.title}`);
+        try {
+          compressedContent = await answerFromContent(tabInfo.content, message);
+          isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
+        } catch (err) {
+          console.error(`[Popup] Error processing tab ${tabInfo.title}:`, err);
+          compressedContent = "Error processing this tab";
+          isRelevant = false;
+        }
       }
 
       compressedTabContents.push({
@@ -226,95 +288,90 @@ async function handleClick() {
         compressed: compressedContent,
         isRelevant: isRelevant
       });
-
-      console.log(`Tab ${i + 1} processed: relevant=${isRelevant}, compressed length=${compressedContent.length}`);
     }
 
-    // Phase 2: Filter to only relevant tabs and combine compressed contents
+    // Phase 2: 过滤相关标签页并组合
     const relevantTabs = compressedTabContents.filter(tab => tab.isRelevant);
-    console.log(`Found ${relevantTabs.length} relevant tabs out of ${compressedTabContents.length}`);
+    console.log(`[Popup] Found ${relevantTabs.length} relevant tabs`);
 
-    const combinedCompressedContext = relevantTabs
+    const combinedContext = relevantTabs
       .map((tabInfo, index) =>
         `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nRelevant Information: ${tabInfo.compressed}\n`
       )
       .join("\n");
 
-    console.log("All tabs processed, generating final answer...");
-
-    // Create final message history with compressed context
     finalMessages = [
       {
         role: "system",
         content: relevantTabs.length > 0
-          ? `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open. Below is the relevant information extracted from ${relevantTabs.length} relevant tabs based on the user's question:\n\n${combinedCompressedContext}\n\nPlease provide a comprehensive answer to the user's question based on this information.`
-          : `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open, but none of them contain information relevant to the question. Please let the user know that no relevant information was found in their open tabs.`
+          ? `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open. Below is the relevant information extracted from ${relevantTabs.length} relevant tabs:\n\n${combinedContext}\n\nPlease provide a comprehensive answer.`
+          : `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open, but none contain relevant information. Please let the user know.`
       },
-      {
-        role: "user",
-        content: message
-      }
+      { role: "user", content: message }
     ];
+
   } else {
-    // Single tab or no tabs: use original logic
-    console.log("Single tab or no tabs, using original logic...");
-    // Combine all tab contents into a single context (for single-tab fallback)
-    pageContext = allTabContents
+    // 单个标签页或无标签页
+    console.log("[Popup] Single tab or no tabs, using original logic...");
+    
+    const pageContext = allTabContents
       .map((tabInfo, index) =>
-        // `[${tabInfo.title}](${tabInfo.url}):${tabInfo.content}\n`
         `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\n\n${tabInfo.content}\n\n`
       )
       .join("\n");
-    // For single tab, use original logic
-    chatHistory.push({
-      role: "system",
-      content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage based on the content provided above.`
-    });
-    console.log("Single tab content loaded:", pageContext.substring(0, 200) + "...");
-    chatHistory.push({ role: "user", content: message });
-    finalMessages = chatHistory;
+
+    finalMessages = [
+      {
+        role: "system",
+        content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage.`
+      },
+      { role: "user", content: message }
+    ];
   }
 
-  console.log("Final messages:", finalMessages);
+  console.log("[Popup] Sending final messages...");
 
-  // Send the final chat completion message to the engine
-  let curMessage = "";
-  const completion = await engine.chat.completions.create({
-    stream: true,
-    messages: finalMessages,
-  });
-
-  // Update the answer as the model generates more text
-  for await (const chunk of completion) {
-    const curDelta = chunk.choices[0].delta.content;
-    if (curDelta) {
-      curMessage += curDelta;
-    }
-    updateAnswer(curMessage);
+  try {
+    await sendStreamingChat(finalMessages);
+  } catch (err) {
+    console.error("[Popup] Chat error:", err);
+    document.getElementById("answer")!.innerHTML = `Error: ${err}`;
   }
-
-  // Update chat history
-  chatHistory.push({ role: "assistant", content: await engine.getMessage() });
- 
 }
 
-submitButton.addEventListener("click", handleClick);
+async function answerFromContent(content: string, question: string): Promise<string> {
+  const messages: ChatMessage[] = [
+    {
+      role: "system",
+      content: "Answer the question based on the provided content. Format: Concise bullet points. If the content doesn't contain relevant information, say 'No relevant information'. No conversational filler."
+    },
+    {
+      role: "user",
+      content: `CONTENT: ${content.substring(0, 8000)}\nQUESTION: ${question}\nANSWER:`
+    }
+  ];
+
+  return sendStreamingChat(messages);
+}
+
+// ==================== UI 更新 ====================
 
 function updateAnswer(answer: string) {
-  // Show answer
   document.getElementById("answerWrapper")!.style.display = "block";
   const answerWithBreaks = answer.replace(/\n/g, "<br>");
   document.getElementById("answer")!.innerHTML = answerWithBreaks;
-  // Add event listener to copy button
-  document.getElementById("copyAnswer")!.addEventListener("click", () => {
-    // Get the answer text
-    const answerText = answer;
-    // Copy the answer text to the clipboard
-    navigator.clipboard
-      .writeText(answerText)
-      .then(() => console.log("Answer text copied to clipboard"))
-      .catch((err) => console.error("Could not copy text: ", err));
-  });
+
+  // 复制按钮
+  const copyButton = document.getElementById("copyAnswer");
+  if (copyButton) {
+    copyButton.onclick = () => {
+      navigator.clipboard.writeText(answer)
+        .then(() => console.log("[Popup] Answer copied"))
+        .catch((err) => console.error("[Popup] Copy error:", err));
+    };
+  }
+
+  // 时间戳
   const options: Intl.DateTimeFormatOptions = {
     month: "short",
     day: "2-digit",
@@ -323,20 +380,21 @@ function updateAnswer(answer: string) {
     second: "2-digit",
   };
   const time = new Date().toLocaleString("en-US", options);
-  // Update timestamp
   document.getElementById("timestamp")!.innerText = time;
-  // Hide loading indicator
+
+  // 隐藏加载指示器
   document.getElementById("loading-indicator")!.style.display = "none";
 }
 
-// Helper function to get cached summary for a URL
+// ==================== 获取页面内容 ====================
+
 async function getCachedSummary(url: string): Promise<CachedSummaryData | null> {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(
       { type: "GET_CACHED_SUMMARY", data: { url } },
       (response) => {
         if (chrome.runtime.lastError) {
-          console.warn("Error getting cached summary:", chrome.runtime.lastError);
+          console.warn("[Popup] Error getting cached summary:", chrome.runtime.lastError);
           resolve(null);
         } else {
           resolve(response?.summary || null);
@@ -346,42 +404,43 @@ async function getCachedSummary(url: string): Promise<CachedSummaryData | null> 
   });
 }
 
+async function getAllCachedSummaries(): Promise<{ [url: string]: CachedSummaryData }> {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      { type: "GET_ALL_CACHED_SUMMARIES" },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.warn("[Popup] Error getting cached summaries:", chrome.runtime.lastError);
+          resolve({});
+        } else {
+          resolve(response?.summaries || {});
+        }
+      }
+    );
+  });
+}
+
 function fetchPageContents() {
-  // Query all tabs in the current window instead of just the active one
-  chrome.tabs.query({ currentWindow: true }, async function (tabs) {
+  chrome.tabs.query({ currentWindow: true }, async (tabs) => {
     if (tabs.length === 0) {
-      console.warn("⚠️ No tabs found in current window");
+      console.warn("[Popup] No tabs found");
       return;
     }
 
-    // First, get all cached summaries
-    const cachedSummariesPromise = new Promise<{ [url: string]: CachedSummaryData }>((resolve) => {
-      chrome.runtime.sendMessage(
-        { type: "GET_ALL_CACHED_SUMMARIES" },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            console.warn("Error getting all cached summaries:", chrome.runtime.lastError);
-            resolve({});
-          } else {
-            resolve(response?.summaries || {});
-          }
-        }
-      );
-    });
-
-    const cachedSummaries = await cachedSummariesPromise;
-    console.log(`Found ${Object.keys(cachedSummaries).length} cached summaries`);
+    // 获取所有缓存摘要
+    const cachedSummaries = await getAllCachedSummaries();
+    console.log(`[Popup] Found ${Object.keys(cachedSummaries).length} cached summaries`);
 
     tabs.forEach((tab) => {
       if (tab.id) {
         try {
           const port = chrome.tabs.connect(tab.id, { name: "channelName" });
           port.postMessage({});
-          port.onMessage.addListener(function (msg) {
+          
+          port.onMessage.addListener((msg) => {
             const tabUrl = tab.url || "Unknown URL";
             const cachedSummary = cachedSummaries[tabUrl];
             
-            // Store each tab's content with metadata and cached summary in the global array
             allTabContents.push({
               title: tab.title || "Untitled",
               url: tabUrl,
@@ -390,35 +449,45 @@ function fetchPageContents() {
               hasCachedSummary: !!cachedSummary
             });
 
-            console.log(`Tab loaded: ${tab.title}, has cached summary: ${!!cachedSummary}`);
+            console.log(`[Popup] Tab loaded: ${tab.title}, has cached summary: ${!!cachedSummary}`);
           });
+
           port.onDisconnect.addListener(() => {
             if (chrome.runtime.lastError) {
-              // Suppress the error and show a warning instead
-              console.warn(`⚠️ Could not connect to tab ${tab.id} (${tab.title || 'Untitled'}): ${chrome.runtime.lastError.message}. This may happen if the extension was recently reloaded - please refresh the page to enable content extraction.`);
+              console.warn(`[Popup] Could not connect to tab ${tab.id}: ${chrome.runtime.lastError.message}`);
             }
           });
         } catch (error) {
-          console.warn(`⚠️ Failed to connect to tab ${tab.id} (${tab.title || 'Untitled'}): ${error instanceof Error ? error.message : String(error)}. This may happen if the extension was recently reloaded - please refresh the page.`);
+          console.warn(`[Popup] Failed to connect to tab ${tab.id}:`, error);
         }
       }
     });
   });
-  
 }
 
+// ==================== 初始化 ====================
 
-// Grab the page contents when the popup is opened
-// Use DOMContentLoaded instead of window.onload to ensure it fires
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', function() {
-    if (useContext) {
-      fetchPageContents();
-    }
-  });
-} else {
-  // Document already loaded
+async function init() {
+  console.log("[Popup] Initializing...");
+  
+  // 获取页面内容
   if (useContext) {
     fetchPageContents();
   }
+
+  // 等待引擎就绪
+  try {
+    await waitForEngine();
+    console.log("[Popup] Engine ready, UI enabled");
+  } catch (err) {
+    console.error("[Popup] Engine initialization failed:", err);
+    document.getElementById("answer")!.innerHTML = "Engine initialization failed. Please reload the extension.";
+  }
+}
+
+// 启动
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
 }

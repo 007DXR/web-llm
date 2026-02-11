@@ -1,66 +1,197 @@
 "use strict";
 
+/**
+ * Offscreen Document - 推理平面
+ * 
+ * 职责：
+ * - 初始化 WebGPU
+ * - 加载模型（权重缓存、分片加载）
+ * - 执行推理，支持 streaming token
+ * - 维护 KV cache / batch / quant 等优化
+ */
+
 import { CreateMLCEngine, MLCEngineInterface, ChatCompletionMessageParam } from "@mlc-ai/web-llm";
 
 console.log("[Offscreen] Offscreen document loaded");
 
+// ==================== 状态管理 ====================
+
 let engine: MLCEngineInterface | null = null;
 let isEngineInitializing = false;
 let engineReady = false;
+let currentModelId = "";
 
-// Initialize the engine
-async function initEngine() {
-  if (engine || isEngineInitializing) return;
+// 请求管理（用于取消）
+const activeRequests = new Map<string, { aborted: boolean }>();
+
+// ==================== 引擎初始化 ====================
+
+async function initEngine(modelId: string = "Llama-3.2-1B-Instruct-q4f16_1-MLC") {
+  if (engine && currentModelId === modelId) {
+    console.log("[Offscreen] Engine already initialized with model:", modelId);
+    return { status: "ready" };
+  }
   
+  if (isEngineInitializing) {
+    console.log("[Offscreen] Engine already initializing...");
+    return { status: "initializing" };
+  }
+
   isEngineInitializing = true;
-  console.log("[Offscreen] Initializing engine...");
-  
+  currentModelId = modelId;
+  console.log("[Offscreen] Initializing engine with model:", modelId);
+
   try {
-    engine = await CreateMLCEngine(
-      "Llama-3.2-1B-Instruct-q4f16_1-MLC",
-      {
-        initProgressCallback: (report) => {
-          console.log("[Offscreen] Engine init progress:", Math.round(report.progress * 100) + "%");
-          // Notify background about progress
-          chrome.runtime.sendMessage({
-            type: "ENGINE_INIT_PROGRESS",
-            data: { progress: report.progress }
-          });
-        }
+    engine = await CreateMLCEngine(modelId, {
+      initProgressCallback: (report) => {
+        const progress = report.progress;
+        console.log("[Offscreen] Engine init progress:", Math.round(progress * 100) + "%");
+        
+        // 通知 background 进度
+        chrome.runtime.sendMessage({
+          type: "ENGINE_INIT_PROGRESS",
+          data: { progress, text: report.text }
+        }).catch(() => {});
       }
-    );
+    });
+
     engineReady = true;
     console.log("[Offscreen] Engine initialized successfully!");
-    
-    // Notify background that engine is ready
+
+    // 通知 background 引擎就绪
     chrome.runtime.sendMessage({
-      type: "ENGINE_READY"
-    });
-    
+      type: "ENGINE_READY",
+      data: { modelId }
+    }).catch(() => {});
+
+    return { status: "ready" };
+
   } catch (err) {
     console.error("[Offscreen] Failed to initialize engine:", err);
+    
     chrome.runtime.sendMessage({
       type: "ENGINE_ERROR",
       data: { error: String(err) }
-    });
+    }).catch(() => {});
+
+    return { status: "error", error: String(err) };
+
   } finally {
     isEngineInitializing = false;
   }
 }
 
-// Summarize a page
-async function summarizePage(url: string, title: string, content: string): Promise<string> {
+// ==================== Chat Completion ====================
+
+async function chatCompletion(
+  requestId: string,
+  messages: ChatCompletionMessageParam[]
+): Promise<{ content: string; usage?: any }> {
+  if (!engine || !engineReady) {
+    throw new Error("Engine not ready");
+  }
+
+  // 注册请求
+  activeRequests.set(requestId, { aborted: false });
+
+  try {
+    const completion = await engine.chat.completions.create({
+      stream: false,
+      messages: messages,
+    });
+
+    // 检查是否已取消
+    if (activeRequests.get(requestId)?.aborted) {
+      throw new Error("Request aborted");
+    }
+
+    const content = completion.choices[0]?.message?.content || "";
+    return { 
+      content,
+      usage: completion.usage
+    };
+
+  } finally {
+    activeRequests.delete(requestId);
+  }
+}
+
+// ==================== Streaming Chat Completion ====================
+
+async function chatCompletionStream(
+  requestId: string,
+  messages: ChatCompletionMessageParam[]
+): Promise<void> {
+  if (!engine || !engineReady) {
+    chrome.runtime.sendMessage({
+      type: "STREAM_CHUNK",
+      data: { requestId, error: "Engine not ready" }
+    });
+    return;
+  }
+
+  // 注册请求
+  activeRequests.set(requestId, { aborted: false });
+
+  try {
+    const completion = await engine.chat.completions.create({
+      stream: true,
+      messages: messages,
+    });
+
+    for await (const chunk of completion) {
+      // 检查是否已取消
+      if (activeRequests.get(requestId)?.aborted) {
+        chrome.runtime.sendMessage({
+          type: "STREAM_CHUNK",
+          data: { requestId, error: "Request aborted", done: true }
+        });
+        return;
+      }
+
+      const delta = chunk.choices[0]?.delta?.content;
+      if (delta) {
+        // 发送 chunk 到 background
+        chrome.runtime.sendMessage({
+          type: "STREAM_CHUNK",
+          data: { requestId, chunk: delta }
+        }).catch(() => {});
+      }
+    }
+
+    // 获取使用统计
+    const usage = await engine.runtimeStatsText();
+
+    // 发送完成信号
+    chrome.runtime.sendMessage({
+      type: "STREAM_CHUNK",
+      data: { requestId, done: true, usage }
+    }).catch(() => {});
+
+  } catch (err) {
+    console.error("[Offscreen] Stream error:", err);
+    chrome.runtime.sendMessage({
+      type: "STREAM_CHUNK",
+      data: { requestId, error: String(err), done: true }
+    }).catch(() => {});
+
+  } finally {
+    activeRequests.delete(requestId);
+  }
+}
+
+// ==================== 页面摘要 ====================
+
+async function summarizePage(
+  url: string,
+  title: string,
+  content: string
+): Promise<{ summary: string }> {
   if (!engine || !engineReady) {
     throw new Error("Engine not ready");
   }
 
   console.log("[Offscreen] Summarizing page:", title);
-
-  // Truncate content if too long
-  const maxContentLength = 8000;
-  const truncatedContent = content.length > maxContentLength 
-    ? content.substring(0, maxContentLength) + "..." 
-    : content;
 
   const messages: ChatCompletionMessageParam[] = [
     {
@@ -69,7 +200,7 @@ async function summarizePage(url: string, title: string, content: string): Promi
     },
     {
       role: "user",
-      content: `Summarize this webpage:\n\nTitle: ${title}\n\nContent:\n${truncatedContent}`
+      content: `Summarize this webpage:\n\nTitle: ${title}\n\nContent:\n${content}`
     }
   ];
 
@@ -80,56 +211,106 @@ async function summarizePage(url: string, title: string, content: string): Promi
   });
 
   for await (const chunk of completion) {
-    const delta = chunk.choices[0].delta.content;
+    const delta = chunk.choices[0]?.delta?.content;
     if (delta) {
       summary += delta;
     }
   }
 
   console.log("[Offscreen] Summary generated:", summary.length, "chars");
-  console.log("[Offscreen] Summary content:\n", summary);
-  return summary;
+  return { summary };
 }
 
-// Listen for messages from background
+// ==================== 请求取消 ====================
+
+function abortRequest(requestId: string) {
+  const request = activeRequests.get(requestId);
+  if (request) {
+    request.aborted = true;
+    console.log("[Offscreen] Request aborted:", requestId);
+  }
+}
+
+// ==================== 重置引擎 ====================
+
+async function resetEngine() {
+  if (engine) {
+    // 取消所有活跃请求
+    for (const [requestId] of activeRequests) {
+      abortRequest(requestId);
+    }
+    activeRequests.clear();
+
+    // 重置聊天
+    await engine.resetChat();
+    console.log("[Offscreen] Engine chat reset");
+  }
+}
+
+// ==================== 消息监听器 ====================
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   console.log("[Offscreen] Received message:", message.type);
 
-  if (message.type === "INIT_ENGINE") {
-    initEngine().then(() => {
-      sendResponse({ status: "initializing" });
-    });
-    return true;
-
-  } else if (message.type === "SUMMARIZE_PAGE") {
-    const { url, title, content } = message.data;
-    
-    if (!engineReady) {
-      sendResponse({ error: "Engine not ready" });
+  switch (message.type) {
+    case "INIT_ENGINE":
+      initEngine(message.data?.modelId).then(sendResponse);
       return true;
-    }
 
-    summarizePage(url, title, content)
-      .then((summary) => {
-        sendResponse({ summary });
-      })
-      .catch((err) => {
-        console.error("[Offscreen] Summarization error:", err);
-        sendResponse({ error: String(err) });
+    case "CHAT_COMPLETION":
+      chatCompletion(message.data.requestId, message.data.messages)
+        .then(result => sendResponse({ success: true, ...result }))
+        .catch(err => sendResponse({ success: false, error: String(err) }));
+      return true;
+
+    case "CHAT_COMPLETION_STREAM":
+      chatCompletionStream(message.data.requestId, message.data.messages)
+        .then(() => sendResponse({ status: "streaming" }))
+        .catch(err => sendResponse({ error: String(err) }));
+      return true;
+
+    case "SUMMARIZE_PAGE":
+      const { url, title, content } = message.data;
+      summarizePage(url, title, content)
+        .then(result => sendResponse(result))
+        .catch(err => sendResponse({ error: String(err) }));
+      return true;
+
+    case "ABORT_REQUEST":
+      abortRequest(message.data.requestId);
+      sendResponse({ status: "aborted" });
+      return true;
+
+    case "RESET_CHAT":
+      resetEngine()
+        .then(() => sendResponse({ status: "reset" }))
+        .catch(err => sendResponse({ error: String(err) }));
+      return true;
+
+    case "CHECK_ENGINE_STATUS":
+      sendResponse({
+        ready: engineReady,
+        initializing: isEngineInitializing,
+        modelId: currentModelId
       });
-    
-    return true; // Keep channel open for async response
+      return true;
 
-  } else if (message.type === "CHECK_ENGINE_STATUS") {
-    sendResponse({ 
-      ready: engineReady, 
-      initializing: isEngineInitializing 
-    });
-    return true;
+    case "GET_RUNTIME_STATS":
+      if (engine) {
+        engine.runtimeStatsText().then(stats => {
+          sendResponse({ stats });
+        });
+      } else {
+        sendResponse({ stats: null });
+      }
+      return true;
+
+    default:
+      return false;
   }
-
-  return false;
 });
 
-// Auto-initialize engine when offscreen document loads
+// ==================== 自动初始化 ====================
+
+// 当 offscreen document 加载时自动初始化引擎
 initEngine();
