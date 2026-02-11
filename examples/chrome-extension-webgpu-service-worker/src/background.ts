@@ -3,11 +3,27 @@ import { ExtensionServiceWorkerMLCEngineHandler } from "@mlc-ai/web-llm";
 console.log("[Background] Service worker starting...");
 
 // Hookup an engine to a service worker handler
-let handler;
+let handler: ExtensionServiceWorkerMLCEngineHandler | undefined;
 
 // Cache key prefixes
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
+
+// Type definitions
+interface PendingPageData {
+  url: string;
+  title: string;
+  content: string;
+  timestamp: number;
+}
+
+interface SummaryData {
+  url: string;
+  title: string;
+  summary: string;
+  timestamp: number;
+  contentLength: number;
+}
 
 // Offscreen document state
 let offscreenDocumentCreated = false;
@@ -48,6 +64,7 @@ async function createOffscreenDocument() {
 // Process pending pages queue
 async function processSummarizationQueue() {
   if (isSummarizing || summarizationQueue.length === 0 || !offscreenEngineReady) {
+    console.log("[Background] Cannot process queue. isSummarizing:", isSummarizing, "queue length:", summarizationQueue.length, "engine ready:", offscreenEngineReady);
     return;
   }
   
@@ -108,17 +125,17 @@ async function processSummarizationQueue() {
 }
 
 // Get cached summary for a URL
-async function getCachedSummary(url: string) {
+async function getCachedSummary(url: string): Promise<SummaryData | null> {
   const cacheKey = SUMMARY_CACHE_PREFIX + url;
   const cached = await chrome.storage.local.get(cacheKey);
-  return cached[cacheKey] || null;
+  return (cached[cacheKey] as SummaryData) || null;
 }
 
 // Get pending page content for a URL
-async function getPendingPage(url: string) {
+async function getPendingPage(url: string): Promise<PendingPageData | null> {
   const cacheKey = PENDING_CACHE_PREFIX + url;
   const cached = await chrome.storage.local.get(cacheKey);
-  return cached[cacheKey] || null;
+  return (cached[cacheKey] as PendingPageData) || null;
 }
 
 // Cache page content and trigger summarization

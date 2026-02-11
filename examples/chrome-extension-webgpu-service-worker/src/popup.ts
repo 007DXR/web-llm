@@ -64,8 +64,10 @@ const initProgressCallback = (report: InitProgressReport) => {
 };
 
 const engine: MLCEngineInterface = await CreateExtensionServiceWorkerMLCEngine(
-      "Llama-3.2-1B-Instruct-q4f16_1-MLC", 
-  // "Llama-3.2-3B-Instruct-q4f32_1-MLC",
+      // "Llama-3.2-1B-Instruct-q4f16_1-MLC", 
+  // "Llama-3.2-3B-Instruct-q4f16_1-MLC",
+  // "Ministral-3-3B-Instruct-2512-BF16-q4f16_1-MLC",
+  "Phi-3-mini-4k-instruct-q4f16_1-MLC",
   { initProgressCallback: initProgressCallback }
 );
 
@@ -121,114 +123,101 @@ async function handleClick() {
   if (allTabContents.length > 1) {
     console.log(`Processing ${allTabContents.length} tabs with smart compression...`);
 
-    // Phase 1: For each tab, use cached summary to determine relevance and extract info
+    // Phase 1: For each tab, answer the question using summary or original content
     const compressedTabContents: { title: string; url: string; compressed: string; isRelevant: boolean }[] = [];
+
+    // Helper function to answer question based on content
+    async function answerFromContent(content: string, question: string): Promise<string> {
+      const messages: ChatCompletionMessageParam[] = [
+        {
+          role: "system",
+          content: "Answer the question based on the provided content. Format: Concise bullet points. If the content doesn't contain relevant information, say 'No relevant information'. No conversational filler."
+        },
+        {
+          role: "user",
+          content: `CONTENT: ${content}\nQUESTION: ${question}\nANSWER:`
+        }
+      ];
+
+      let answer = "";
+      const completion = await engine.chat.completions.create({
+        stream: true,
+        messages: messages,
+      });
+
+      for await (const chunk of completion) {
+        const curDelta = chunk.choices[0].delta.content;
+        if (curDelta) {
+          answer += curDelta;
+        }
+      }
+      return answer;
+    }
 
     for (let i = 0; i < allTabContents.length; i++) {
       const tabInfo = allTabContents[i];
       console.log(`Processing tab ${i + 1}/${allTabContents.length}: ${tabInfo.title} (has cached summary: ${tabInfo.hasCachedSummary})`);
 
       let compressedContent = "";
-      let isRelevant = false;
+      let isRelevant = true;
 
       if (tabInfo.hasCachedSummary && tabInfo.cachedSummary) {
-        // Step 1: Use cached summary to check relevance
-        console.log(`Checking relevance using cached summary for: ${tabInfo.title}`);
+        // Step 1: Try to answer using cached summary first
+        console.log(`Attempting to answer using cached summary for: ${tabInfo.title}; summary: ${tabInfo.cachedSummary}`);
         
-        const relevanceMessages: ChatCompletionMessageParam[] = [
+        const summaryMessages: ChatCompletionMessageParam[] = [
           {
             role: "system",
-            content: "Classify page relevance. Always output ALL three lines in this exact format:\nRELEVANT: yes\nSUFFICIENT: yes\nEXTRACTED: key facts here\n\nOr if not relevant:\nRELEVANT: no\nSUFFICIENT: no\nEXTRACTED: N/A"
+            content: "Answer the question based on the summary. Output format:\nSUFFICIENT: yes/no (whether the summary has enough info to answer)\nANSWER: your answer here (or 'N/A' if not sufficient)\n\nBe concise. If the summary lacks necessary details, mark as not sufficient."
           },
           {
             role: "user",
-            content: `Summary: ${tabInfo.cachedSummary}\n\nQuestion: ${message}\n\nOutput all three lines:`
+            content: `SUMMARY: ${tabInfo.cachedSummary}\n\nQUESTION: ${message}\n\nOutput:`
           }
         ];
 
-        let relevanceResponse = "";
-        const relevanceCompletion = await engine.chat.completions.create({
+        let summaryResponse = "";
+        const summaryCompletion = await engine.chat.completions.create({
           stream: true,
-          messages: relevanceMessages,
+          messages: summaryMessages,
         });
 
-        for await (const chunk of relevanceCompletion) {
+        for await (const chunk of summaryCompletion) {
           const curDelta = chunk.choices[0].delta.content;
           if (curDelta) {
-            relevanceResponse += curDelta;
+            summaryResponse += curDelta;
           }
         }
 
-        console.log(`Relevance check result for ${tabInfo.title}:`, relevanceResponse);
+        console.log(`Summary-based answer for ${tabInfo.title}:`, summaryResponse);
 
-        // Parse the relevance response
-        const isPageRelevant = relevanceResponse.toLowerCase().includes("relevant: yes");
-        const isSufficient = relevanceResponse.toLowerCase().includes("sufficient: yes");
-        isRelevant = isPageRelevant;
-
-        if (isPageRelevant) {
-          if (isSufficient) {
-            // Extract from the relevance response (after "EXTRACTED:")
-            const extractedMatch = relevanceResponse.match(/EXTRACTED:\s*([\s\S]*)/i);
-            compressedContent = extractedMatch ? extractedMatch[1].trim() : tabInfo.cachedSummary;
-            console.log(`Summary sufficient for ${tabInfo.title}, using extracted info`);
-          } else {
-            // Summary not sufficient, need to extract from original content
-            console.log(`Summary not sufficient for ${tabInfo.title}, extracting from original content`);
-            
-            const extractionMessages: ChatCompletionMessageParam[] = [
-              {
-                role: "system",
-                content: "Extract facts from the provided content that answer the question. Format: Concise bullet points. If missing, say 'No relevant information'. No conversational filler."
-              },
-              {
-                role: "user",
-                content: `CONTEXT: ${tabInfo.content}\nQUESTION: ${message}\nRESULT:`
-              }
-            ];
-
-            const extractionCompletion = await engine.chat.completions.create({
-              stream: true,
-              messages: extractionMessages,
-            });
-
-            for await (const chunk of extractionCompletion) {
-              const curDelta = chunk.choices[0].delta.content;
-              if (curDelta) {
-                compressedContent += curDelta;
-              }
-            }
-          }
+        // Check if the summary was sufficient to answer
+        const isSufficient = summaryResponse.toLowerCase().includes("sufficient: yes");
+        
+        if (isSufficient) {
+          // Extract the answer from the response
+          const answerMatch = summaryResponse.match(/ANSWER:\s*([\s\S]*)/i);
+          compressedContent = answerMatch ? answerMatch[1].trim() : summaryResponse;
+          console.log(`Summary sufficient for ${tabInfo.title}, using answer from summary`);
+          
+          // Check if the answer indicates no relevant info
+          isRelevant = !compressedContent.toLowerCase().includes("no relevant information") && 
+                       compressedContent.toLowerCase() !== "n/a";
         } else {
-          compressedContent = "No relevant information for this question.";
+          // Summary not sufficient, need to answer from original content
+          console.log(`Summary not sufficient for ${tabInfo.title}, answering from original content:${tabInfo.content}`);
+          compressedContent = await answerFromContent(tabInfo.content, message);
+          
+          // Check if the answer indicates no relevant info
+          isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
         }
       } else {
-        // No cached summary - fallback to original compression logic
-        console.log(`No cached summary for ${tabInfo.title}, using full content extraction`);
-        isRelevant = true; // Assume relevant when no summary available
-
-        const compressionMessages: ChatCompletionMessageParam[] = [
-          {
-            role: "system",
-            content: "Extract facts from the provided content that answer the question. Format: Concise bullet points. If missing, say 'No relevant information'. No conversational filler."
-          },
-          {
-            role: "user",
-            content: `CONTEXT: ${tabInfo.content}\nQUESTION: ${message}\nRESULT:`
-          }
-        ];
-
-        const compressionCompletion = await engine.chat.completions.create({
-          stream: true,
-          messages: compressionMessages,
-        });
-
-        for await (const chunk of compressionCompletion) {
-          const curDelta = chunk.choices[0].delta.content;
-          if (curDelta) {
-            compressedContent += curDelta;
-          }
-        }
+        // No cached summary - answer directly from original content
+        console.log(`No cached summary for ${tabInfo.title}, answering from original content:${tabInfo.content}`);
+        compressedContent = await answerFromContent(tabInfo.content, message);
+        
+        // Check if the answer indicates no relevant info
+        isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
       }
 
       compressedTabContents.push({
@@ -245,17 +234,11 @@ async function handleClick() {
     const relevantTabs = compressedTabContents.filter(tab => tab.isRelevant);
     console.log(`Found ${relevantTabs.length} relevant tabs out of ${compressedTabContents.length}`);
 
-    const combinedCompressedContext = relevantTabs.length > 0
-      ? relevantTabs
-          .map((tabInfo, index) =>
-            `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nRelevant Information: ${tabInfo.compressed}\n`
-          )
-          .join("\n")
-      : compressedTabContents
-          .map((tabInfo, index) =>
-            `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nRelevant Information: ${tabInfo.compressed}\n`
-          )
-          .join("\n");
+    const combinedCompressedContext = relevantTabs
+      .map((tabInfo, index) =>
+        `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nRelevant Information: ${tabInfo.compressed}\n`
+      )
+      .join("\n");
 
     console.log("All tabs processed, generating final answer...");
 
@@ -263,7 +246,9 @@ async function handleClick() {
     finalMessages = [
       {
         role: "system",
-        content: `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open. Below is the relevant information extracted from ${relevantTabs.length > 0 ? relevantTabs.length + ' relevant' : 'all'} tabs based on the user's question:\n\n${combinedCompressedContext}\n\nPlease provide a comprehensive answer to the user's question based on this information.`
+        content: relevantTabs.length > 0
+          ? `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open. Below is the relevant information extracted from ${relevantTabs.length} relevant tabs based on the user's question:\n\n${combinedCompressedContext}\n\nPlease provide a comprehensive answer to the user's question based on this information.`
+          : `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open, but none of them contain information relevant to the question. Please let the user know that no relevant information was found in their open tabs.`
       },
       {
         role: "user",
