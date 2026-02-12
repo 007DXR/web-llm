@@ -27,14 +27,41 @@ const activeRequests = new Map<string, { aborted: boolean }>();
 // ==================== 引擎初始化 ====================
 
 async function initEngine(modelId: string = "Llama-3.2-1B-Instruct-q4f16_1-MLC") {
-  if (engine && currentModelId === modelId) {
+  // If same model is already initialized, return ready
+  if (engine && currentModelId === modelId && engineReady) {
     console.log("[Offscreen] Engine already initialized with model:", modelId);
     return { status: "ready" };
   }
   
-  if (isEngineInitializing) {
-    console.log("[Offscreen] Engine already initializing...");
+  // If initializing the same model, return initializing status
+  if (isEngineInitializing && currentModelId === modelId) {
+    console.log("[Offscreen] Engine already initializing with model:", modelId);
     return { status: "initializing" };
+  }
+
+  // If a different model is requested, we need to unload the current engine
+  if (engine && currentModelId !== modelId) {
+    console.log("[Offscreen] Switching model from", currentModelId, "to", modelId);
+    
+    // Cancel all active requests
+    for (const [requestId] of activeRequests) {
+      const request = activeRequests.get(requestId);
+      if (request) {
+        request.aborted = true;
+      }
+    }
+    activeRequests.clear();
+    
+    // Unload current engine
+    try {
+      await engine.unload();
+      console.log("[Offscreen] Previous engine unloaded");
+    } catch (err) {
+      console.warn("[Offscreen] Error unloading engine:", err);
+    }
+    
+    engine = null;
+    engineReady = false;
   }
 
   isEngineInitializing = true;

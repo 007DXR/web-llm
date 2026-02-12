@@ -238,3 +238,103 @@ p {
   color: #5e80a7;
   background-color: transparent;
 }
+
+/* HEADER ROW */
+.header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.model-display {
+  font-size: 0.75rem;
+  color: #1b263b;
+  background-color: rgba(255, 255, 255, 0.3);
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-btn {
+  padding: 0.4rem 0.5rem;
+  background-color: transparent;
+  color: #1b263b;
+}
+
+.settings-btn:hover {
+  background-color: rgba(255, 255, 255, 0.3);
+}
+
+/* SETTINGS PAGE */
+#settings-page {
+  padding: 0.5rem;
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.settings-header h3 {
+  margin: 0;
+  color: #1b263b;
+}
+
+.back-btn {
+  padding: 0.4rem 0.5rem;
+  background-color: transparent;
+  color: #1b263b;
+}
+
+.back-btn:hover {
+  background-color: rgba(255, 255, 255, 0.3);
+}
+
+.settings-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.settings-content label {
+  font-weight: bold;
+  color: #1b263b;
+}
+
+.model-select {
+  padding: 0.5rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  background-color: white;
+  cursor: pointer;
+}
+
+.model-select:focus {
+  outline: 2px solid #1b263b;
+}
+
+.model-info {
+  font-size: 0.75rem;
+  color: #333;
+  background-color: rgba(255, 255, 255, 0.5);
+  padding: 0.5rem;
+  border-radius: 4px;
+}
+
+.save-btn {
+  margin-top: 0.5rem;
+  padding: 0.6rem 1rem;
+}
+
+.settings-status {
+  font-size: 0.8rem;
+  color: #333;
+  min-height: 1.2rem;
+}

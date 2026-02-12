@@ -14,6 +14,7 @@
 
 import "./popup.css";
 import { ProgressBar, Line } from "progressbar.js";
+import { prebuiltAppConfig, ModelRecord } from "@mlc-ai/web-llm";
 
 // ==================== 类型定义 ====================
 
@@ -51,10 +52,34 @@ interface StreamChunk {
 const useContext = true;
 console.log("[Popup] useContext:", useContext);
 
+// ==================== Model Configuration ====================
+
+// Get available models from web-llm config (filter for LLM models suitable for extension)
+function getAvailableModels(): ModelRecord[] {
+  return prebuiltAppConfig.model_list.filter(model => {
+    // Filter for reasonable size models (under 8GB VRAM) for browser extension use
+    const vram = model.vram_required_MB || 0;
+    return vram > 0 && vram < 8000 && model.model_id;
+  });
+}
+
+const AVAILABLE_MODELS = getAvailableModels();
+
 // ==================== UI 元素 ====================
 
 const queryInput = document.getElementById("query-input")! as HTMLInputElement;
 const submitButton = document.getElementById("submit-button")! as HTMLButtonElement;
+
+// Settings elements
+const settingsButton = document.getElementById("settings-button")! as HTMLButtonElement;
+const backButton = document.getElementById("back-button")! as HTMLButtonElement;
+const chatPage = document.getElementById("chat-page")! as HTMLDivElement;
+const settingsPage = document.getElementById("settings-page")! as HTMLDivElement;
+const modelSelect = document.getElementById("model-select")! as HTMLSelectElement;
+const modelInfo = document.getElementById("model-info")! as HTMLDivElement;
+const saveSettingsButton = document.getElementById("save-settings")! as HTMLButtonElement;
+const settingsStatus = document.getElementById("settings-status")! as HTMLDivElement;
+const currentModelDisplay = document.getElementById("current-model-display")! as HTMLSpanElement;
 
 submitButton.disabled = true;
 
@@ -72,16 +97,147 @@ const progressBar: ProgressBar = new Line("#loadingContainer", {
 
 let isLoadingParams = true;
 let allTabContents: TabContent[] = [];
+let currentModelId = "";
+
+// ==================== Settings Functions ====================
+
+function populateModelSelect(selectedModelId?: string) {
+  modelSelect.innerHTML = "";
+  
+  AVAILABLE_MODELS.forEach(model => {
+    const option = document.createElement("option");
+    option.value = model.model_id;
+    option.textContent = model.model_id;
+    if (model.model_id === selectedModelId) {
+      option.selected = true;
+    }
+    modelSelect.appendChild(option);
+  });
+  
+  updateModelInfo();
+}
+
+function updateModelInfo() {
+  const selectedId = modelSelect.value;
+  const model = AVAILABLE_MODELS.find(m => m.model_id === selectedId);
+  
+  if (model) {
+    const vram = model.vram_required_MB?.toFixed(0) || "Unknown";
+    const lowResource = model.low_resource_required ? "Yes" : "No";
+    modelInfo.innerHTML = `
+      <div><strong>VRAM Required:</strong> ${vram} MB</div>
+      <div><strong>Low Resource:</strong> ${lowResource}</div>
+    `;
+  } else {
+    modelInfo.innerHTML = "";
+  }
+}
+
+function showSettingsPage() {
+  chatPage.style.display = "none";
+  settingsPage.style.display = "block";
+  settingsStatus.textContent = "";
+  
+  // Get current model and populate select
+  chrome.runtime.sendMessage({ type: "GET_SAVED_MODEL_ID" }, (response) => {
+    const savedModelId = response?.modelId || AVAILABLE_MODELS[0]?.model_id;
+    populateModelSelect(savedModelId);
+  });
+}
+
+function showChatPage() {
+  settingsPage.style.display = "none";
+  chatPage.style.display = "block";
+}
+
+async function saveSettings() {
+  const newModelId = modelSelect.value;
+  
+  if (!newModelId) {
+    settingsStatus.textContent = "Please select a model.";
+    return;
+  }
+  
+  settingsStatus.textContent = "Saving...";
+  saveSettingsButton.disabled = true;
+  
+  chrome.runtime.sendMessage({
+    type: "CHANGE_MODEL",
+    data: { modelId: newModelId }
+  }, (response) => {
+    if (chrome.runtime.lastError) {
+      settingsStatus.textContent = "Error: " + chrome.runtime.lastError.message;
+      saveSettingsButton.disabled = false;
+      return;
+    }
+    
+    if (response?.success) {
+      if (response.status === "same_model") {
+        settingsStatus.textContent = "Model unchanged.";
+        saveSettingsButton.disabled = false;
+      } else {
+        currentModelId = newModelId;
+        updateCurrentModelDisplay();
+        settingsStatus.textContent = "Model changed! Reloading engine...";
+        
+        // Go back to chat page and show loading
+        showChatPage();
+        isLoadingParams = true;
+        submitButton.disabled = true;
+        
+        // Recreate loading bar if needed
+        let loadingContainer = document.getElementById("loadingContainer");
+        if (!loadingContainer) {
+          loadingContainer = document.createElement("div");
+          loadingContainer.id = "loadingContainer";
+          chatPage.insertBefore(loadingContainer, chatPage.firstChild);
+        }
+        
+        // Wait for new engine
+        waitForEngine().then(() => {
+          console.log("[Popup] New model loaded successfully");
+        }).catch(err => {
+          console.error("[Popup] Failed to load new model:", err);
+        });
+      }
+    } else {
+      settingsStatus.textContent = "Error: " + (response?.error || "Unknown error");
+      saveSettingsButton.disabled = false;
+    }
+  });
+}
+
+function updateCurrentModelDisplay() {
+  if (currentModelId) {
+    // Show shortened model name
+    const shortName = currentModelId.replace("-MLC", "").substring(0, 25);
+    currentModelDisplay.textContent = shortName + (currentModelId.length > 25 ? "..." : "");
+    currentModelDisplay.title = currentModelId;
+  } else {
+    currentModelDisplay.textContent = "Loading...";
+  }
+}
+
+// Settings event listeners
+settingsButton.addEventListener("click", showSettingsPage);
+backButton.addEventListener("click", showChatPage);
+modelSelect.addEventListener("change", updateModelInfo);
+saveSettingsButton.addEventListener("click", saveSettings);
 
 // ==================== 引擎状态管理 ====================
 
-async function checkEngineStatus(): Promise<{ ready: boolean; progress: number }> {
+async function checkEngineStatus(): Promise<{ ready: boolean; progress: number; modelId?: string }> {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: "GET_ENGINE_STATUS" }, (response) => {
       if (chrome.runtime.lastError) {
         console.warn("[Popup] Error checking engine status:", chrome.runtime.lastError);
         resolve({ ready: false, progress: 0 });
       } else {
+        // Update current model display
+        if (response?.modelId) {
+          currentModelId = response.modelId;
+          updateCurrentModelDisplay();
+        }
         resolve(response || { ready: false, progress: 0 });
       }
     });

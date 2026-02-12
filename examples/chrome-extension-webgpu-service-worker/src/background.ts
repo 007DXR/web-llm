@@ -37,12 +37,32 @@ interface StreamChunk {
   usage?: any;
 }
 
+interface EngineInitResult {
+  status: "ready" | "initializing" | "error" | "already_ready" | "already_initializing";
+  modelId: string;
+  error?: string;
+}
+
 // ==================== 常量配置 ====================
 
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
-const MODEL_ID = "Llama-3.2-3B-Instruct-q4f32_1-MLC"//"Phi-3-mini-4k-instruct-q4f16_1-MLC";
-console.log("[Background] MODEL_ID:", MODEL_ID);
+const DEFAULT_MODEL_ID = "Llama-3.2-3B-Instruct-q4f32_1-MLC";
+const MODEL_STORAGE_KEY = "selected_model_id";
+
+let currentModelId = DEFAULT_MODEL_ID;
+
+// Load model ID from storage
+async function loadModelIdFromStorage(): Promise<string> {
+  const result = await chrome.storage.local.get(MODEL_STORAGE_KEY);
+  return (result[MODEL_STORAGE_KEY] as string) || DEFAULT_MODEL_ID;
+}
+
+async function saveModelIdToStorage(modelId: string): Promise<void> {
+  await chrome.storage.local.set({ [MODEL_STORAGE_KEY]: modelId });
+}
+
+console.log("[Background] Default MODEL_ID:", DEFAULT_MODEL_ID);
 // 配额和限制
 const CONFIG = {
   maxConcurrentRequests: 1,
@@ -57,6 +77,7 @@ const CONFIG = {
 let offscreenDocumentCreated = false;
 let offscreenEngineReady = false;
 let engineInitProgress = 0;
+let isEngineInitializing = false;  // 防止重复初始化
 
 // 摘要队列
 const summarizationQueue: string[] = [];
@@ -101,27 +122,42 @@ async function ensureOffscreenDocument(): Promise<boolean> {
   }
 }
 
-async function initializeEngine(): Promise<boolean> {
-  if (offscreenEngineReady) {
-    return true;
+async function initializeEngine(forceModelId?: string): Promise<EngineInitResult> {
+  const modelId = forceModelId || currentModelId;
+  
+  if (offscreenEngineReady && !forceModelId) {
+    return { status: "already_ready", modelId };
+  }
+
+  // 如果已经在初始化相同的模型，直接返回
+  if (isEngineInitializing && !forceModelId) {
+    console.log("[Background] Engine already initializing, skipping duplicate request");
+    return { status: "already_initializing", modelId };
   }
 
   const created = await ensureOffscreenDocument();
   if (!created) {
-    return false;
+    return { status: "error", modelId, error: "Failed to create offscreen document" };
   }
+
+  isEngineInitializing = true;
+  console.log("[Background] Initializing engine with model:", modelId);
 
   // 发送初始化请求到 offscreen
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({
       type: "INIT_ENGINE",
-      data: { modelId: MODEL_ID }
+      data: { modelId: modelId }
     }, (response) => {
       if (chrome.runtime.lastError) {
         console.error("[Background] Init engine error:", chrome.runtime.lastError);
-        resolve(false);
+        resolve({ status: "error", modelId, error: chrome.runtime.lastError.message });
+      } else if (response?.status === "ready") {
+        resolve({ status: "ready", modelId });
+      } else if (response?.status === "initializing") {
+        resolve({ status: "initializing", modelId });
       } else {
-        resolve(response?.status === "initializing" || response?.status === "ready");
+        resolve({ status: "error", modelId, error: "Unknown response from offscreen" });
       }
     });
   });
@@ -263,6 +299,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "ENGINE_READY":
       offscreenEngineReady = true;
       engineInitProgress = 1;
+      isEngineInitializing = false;
       console.log("[Background] Engine ready!");
       processSummarizationQueue();
       sendResponse({ status: "acknowledged" });
@@ -276,6 +313,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case "ENGINE_ERROR":
       console.error("[Background] Engine error:", message.data.error);
+      isEngineInitializing = false;
       sendResponse({ status: "acknowledged" });
       return true;
 
@@ -298,13 +336,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({
         ready: offscreenEngineReady,
         progress: engineInitProgress,
-        modelId: MODEL_ID
+        modelId: currentModelId
+      });
+      return true;
+
+    case "CHANGE_MODEL": {
+      const newModelId = message.data?.modelId;
+      if (!newModelId) {
+        sendResponse({ success: false, error: "No model ID provided" });
+        return true;
+      }
+      
+      if (newModelId === currentModelId && offscreenEngineReady) {
+        sendResponse({ success: true, status: "same_model" });
+        return true;
+      }
+      
+      // Save to storage and reinitialize
+      currentModelId = newModelId;
+      offscreenEngineReady = false;
+      engineInitProgress = 0;
+      isEngineInitializing = true;  // Set IMMEDIATELY to prevent race with INIT_ENGINE_REQUEST
+      
+      // Save to storage (fire and forget) and initialize engine
+      saveModelIdToStorage(newModelId).catch(err => 
+        console.error("[Background] Failed to save model ID:", err)
+      );
+      
+      initializeEngine(newModelId).then((result) => {
+        sendResponse({ success: result.status !== "error", status: result.status, modelId: result.modelId, error: result.error });
+      });
+      return true;
+    }
+
+    case "GET_SAVED_MODEL_ID":
+      loadModelIdFromStorage().then(modelId => {
+        sendResponse({ modelId });
       });
       return true;
 
     case "INIT_ENGINE_REQUEST":
-      initializeEngine().then(() => {
-        sendResponse({ status: offscreenEngineReady ? "ready" : "initializing" });
+      initializeEngine().then((result) => {
+        sendResponse({ status: result.status, modelId: result.modelId, error: result.error });
       });
       return true;
 
@@ -355,7 +428,11 @@ chrome.runtime.onConnect.addListener((port) => {
         // 确保引擎就绪
         if (!offscreenEngineReady) {
           port.postMessage({ type: "status", status: "initializing", progress: engineInitProgress });
-          await initializeEngine();
+          const result = await initializeEngine();
+          if (result.status === "error") {
+            port.postMessage({ type: "error", error: result.error || "Engine initialization failed" });
+            return;
+          }
         }
 
         if (!offscreenEngineReady) {
@@ -401,7 +478,12 @@ chrome.runtime.onConnect.addListener((port) => {
 
 // ==================== 初始化 ====================
 
-// 启动时创建 offscreen document
-ensureOffscreenDocument().then(() => {
-  console.log("[Background] Initialization complete");
+// 启动时加载保存的模型 ID 并创建 offscreen document
+loadModelIdFromStorage().then(savedModelId => {
+  currentModelId = savedModelId;
+  console.log("[Background] Loaded model ID from storage:", currentModelId);
+  
+  ensureOffscreenDocument().then(() => {
+    console.log("[Background] Initialization complete");
+  });
 });
