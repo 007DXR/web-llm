@@ -41,8 +41,8 @@ interface StreamChunk {
 
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
-const MODEL_ID = "Llama-3.2-1B-Instruct-q4f16_1-MLC";
-
+const MODEL_ID = "Llama-3.2-3B-Instruct-q4f32_1-MLC"//"Phi-3-mini-4k-instruct-q4f16_1-MLC";
+console.log("[Background] MODEL_ID:", MODEL_ID);
 // 配额和限制
 const CONFIG = {
   maxConcurrentRequests: 1,

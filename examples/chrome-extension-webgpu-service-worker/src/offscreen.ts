@@ -116,6 +116,20 @@ async function chatCompletion(
   }
 }
 
+// ==================== 超时工具函数 ====================
+
+const STREAM_TIMEOUT_MS = 60000; // 60秒超时
+const CHUNK_TIMEOUT_MS = 30000; // 单个 chunk 超时 30 秒
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => 
+      setTimeout(() => reject(new Error(`${operation} timeout after ${timeoutMs}ms`)), timeoutMs)
+    )
+  ]);
+}
+
 // ==================== Streaming Chat Completion ====================
 
 async function chatCompletionStream(
@@ -134,20 +148,37 @@ async function chatCompletionStream(
   activeRequests.set(requestId, { aborted: false });
 
   try {
-    const completion = await engine.chat.completions.create({
-      stream: true,
-      messages: messages,
-    });
+    const completion = await withTimeout(
+      engine.chat.completions.create({
+        stream: true,
+        messages: messages,
+        stream_options: { include_usage: true },
+      }),
+      STREAM_TIMEOUT_MS,
+      "Chat completion create"
+    );
+
+    let usage = null;
+    let lastChunkTime = Date.now();
 
     for await (const chunk of completion) {
       // 检查是否已取消
       if (activeRequests.get(requestId)?.aborted) {
+        await engine.interruptGenerate();
         chrome.runtime.sendMessage({
           type: "STREAM_CHUNK",
           data: { requestId, error: "Request aborted", done: true }
         });
         return;
       }
+
+      // 检查 chunk 间隔超时
+      const now = Date.now();
+      if (now - lastChunkTime > CHUNK_TIMEOUT_MS) {
+        await engine.interruptGenerate();
+        throw new Error("Stream stalled - no chunk received for " + CHUNK_TIMEOUT_MS + "ms");
+      }
+      lastChunkTime = now;
 
       const delta = chunk.choices[0]?.delta?.content;
       if (delta) {
@@ -157,10 +188,12 @@ async function chatCompletionStream(
           data: { requestId, chunk: delta }
         }).catch(() => {});
       }
-    }
 
-    // 获取使用统计
-    const usage = await engine.runtimeStatsText();
+      // 获取使用统计（在最后一个 chunk 中）
+      if (chunk.usage) {
+        usage = chunk.usage;
+      }
+    }
 
     // 发送完成信号
     chrome.runtime.sendMessage({
@@ -193,6 +226,9 @@ async function summarizePage(
 
   console.log("[Offscreen] Summarizing page:", title);
 
+  const requestId = `summarize_${Date.now()}`;
+  activeRequests.set(requestId, { aborted: false });
+
   const messages: ChatCompletionMessageParam[] = [
     {
       role: "system",
@@ -204,21 +240,46 @@ async function summarizePage(
     }
   ];
 
-  let summary = "";
-  const completion = await engine.chat.completions.create({
-    stream: true,
-    messages: messages,
-  });
+  try {
+    let summary = "";
+    const completion = await withTimeout(
+      engine.chat.completions.create({
+        stream: true,
+        messages: messages,
+      }),
+      STREAM_TIMEOUT_MS,
+      "Summarize completion create"
+    );
 
-  for await (const chunk of completion) {
-    const delta = chunk.choices[0]?.delta?.content;
-    if (delta) {
-      summary += delta;
+    let lastChunkTime = Date.now();
+
+    for await (const chunk of completion) {
+      // 检查是否已取消
+      if (activeRequests.get(requestId)?.aborted) {
+        await engine.interruptGenerate();
+        throw new Error("Request aborted");
+      }
+
+      // 检查 chunk 间隔超时
+      const now = Date.now();
+      if (now - lastChunkTime > CHUNK_TIMEOUT_MS) {
+        await engine.interruptGenerate();
+        throw new Error("Stream stalled - no chunk received for " + CHUNK_TIMEOUT_MS + "ms");
+      }
+      lastChunkTime = now;
+
+      const delta = chunk.choices[0]?.delta?.content;
+      if (delta) {
+        summary += delta;
+      }
     }
-  }
 
-  console.log("[Offscreen] Summary generated:", summary.length, "chars");
-  return { summary };
+    console.log("[Offscreen] Summary generated:", summary.length, "chars");
+    return { summary };
+
+  } finally {
+    activeRequests.delete(requestId);
+  }
 }
 
 // ==================== 请求取消 ====================
@@ -296,13 +357,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
 
     case "GET_RUNTIME_STATS":
-      if (engine) {
-        engine.runtimeStatsText().then(stats => {
-          sendResponse({ stats });
-        });
-      } else {
-        sendResponse({ stats: null });
-      }
+      // Note: runtimeStatsText() is deprecated. Use ChatCompletion.usage or
+      // ChatCompletionChunk.usage (with stream_options: { include_usage: true }) instead.
+      sendResponse({ stats: null, deprecated: true });
       return true;
 
     default:
@@ -310,7 +367,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-// ==================== 自动初始化 ====================
-
-// 当 offscreen document 加载时自动初始化引擎
-initEngine();
+// ==================== 注意 ====================
+// 不要在这里自动调用 initEngine()
+// 引擎初始化由 background service worker 通过 INIT_ENGINE 消息触发
+// 这样可以确保使用 background 中配置的 MODEL_ID

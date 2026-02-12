@@ -142,7 +142,8 @@ function enableInputs() {
 
 // ==================== Streaming Chat ====================
 
-async function sendStreamingChat(messages: ChatMessage[]): Promise<string> {
+// updateUI: true 更新 UI（最终答案），false 静默模式（中间处理）
+async function sendStreamingChat(messages: ChatMessage[], updateUI: boolean = true): Promise<string> {
   return new Promise((resolve, reject) => {
     const port = chrome.runtime.connect({ name: "chat_stream" });
     let fullMessage = "";
@@ -159,10 +160,13 @@ async function sendStreamingChat(messages: ChatMessage[]): Promise<string> {
 
         if (chunk.chunk) {
           fullMessage += chunk.chunk;
-          updateAnswer(fullMessage);
+          if (updateUI) {
+            updateAnswer(fullMessage);
+          }
         }
 
         if (chunk.done) {
+          console.log("fullMessage:", fullMessage);
           resolve(fullMessage);
           port.disconnect();
         }
@@ -180,7 +184,6 @@ async function sendStreamingChat(messages: ChatMessage[]): Promise<string> {
       }
     });
 
-    // 发送聊天请求
     port.postMessage({
       type: "CHAT_STREAM_START",
       messages: messages
@@ -242,25 +245,28 @@ async function handleClick() {
         const summaryMessages: ChatMessage[] = [
           {
             role: "system",
-            content: "Answer the question based on the summary. Output format:\nSUFFICIENT: yes/no\nANSWER: your answer here (or 'N/A' if not sufficient)\n\nBe concise."
+            content: "Answer the question based on the summary. You MUST use this EXACT format (no markdown, no asterisks):\nSUFFICIENT: yes\nANSWER: your answer\n\nOR if info not found:\nSUFFICIENT: no\nANSWER: N/A\n\nBe concise. No extra text."
           },
           {
             role: "user",
-            content: `SUMMARY: ${tabInfo.cachedSummary}\n\nQUESTION: ${message}\n\nOutput:`
+            content: `SUMMARY: ${tabInfo.cachedSummary}\n\nQUESTION: ${message}`
           }
         ];
 
         try {
-          const summaryResponse = await sendStreamingChat(summaryMessages);
-          const isSufficient = summaryResponse.toLowerCase().includes("sufficient: yes");
+          // 使用静默模式，不更新 UI
+          const summaryResponse = await sendStreamingChat(summaryMessages, false);
           
-          if (isSufficient) {
-            const answerMatch = summaryResponse.match(/ANSWER:\s*([\s\S]*)/i);
-            compressedContent = answerMatch ? answerMatch[1].trim() : summaryResponse;
+          // 解析响应 - 更健壮的解析逻辑
+          const parsedResult = parseSummaryResponse(summaryResponse);
+          
+          if (parsedResult.sufficient) {
+            compressedContent = parsedResult.answer;
             isRelevant = !compressedContent.toLowerCase().includes("no relevant information") &&
-                         compressedContent.toLowerCase() !== "n/a";
+                         compressedContent.toLowerCase() !== "n/a" &&
+                         compressedContent.trim() !== "";
           } else {
-            // 摘要不够，使用原始内容
+            // 摘要不够，使用原始内容（静默模式）
             compressedContent = await answerFromContent(tabInfo.content, message);
             isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
           }
@@ -270,7 +276,7 @@ async function handleClick() {
           isRelevant = false;
         }
       } else {
-        // 无缓存摘要，直接使用原始内容
+        // 无缓存摘要，直接使用原始内容（静默模式）
         console.log(`[Popup] No cached summary for: ${tabInfo.title}`);
         try {
           compressedContent = await answerFromContent(tabInfo.content, message);
@@ -339,6 +345,7 @@ async function handleClick() {
   }
 }
 
+// 中间处理函数：使用静默模式，不更新 UI
 async function answerFromContent(content: string, question: string): Promise<string> {
   const messages: ChatMessage[] = [
     {
@@ -351,7 +358,36 @@ async function answerFromContent(content: string, question: string): Promise<str
     }
   ];
 
-  return sendStreamingChat(messages);
+  return sendStreamingChat(messages, false);
+}
+
+// 解析摘要响应 - 处理各种格式变体
+function parseSummaryResponse(response: string): { sufficient: boolean; answer: string } {
+  const normalized = response.toLowerCase();
+  
+  // 检查 SUFFICIENT - 支持多种格式：
+  // "SUFFICIENT: yes", "**Sufficient:** yes", "sufficient:yes"
+  const sufficientMatch = normalized.match(/\*{0,2}sufficient\*{0,2}:\s*(yes|no)/i);
+  const hasSufficient = sufficientMatch !== null;
+  const isSufficient = sufficientMatch ? sufficientMatch[1] === "yes" : false;
+  
+  // 提取 ANSWER - 支持多种格式：
+  // "ANSWER: xxx", "**Answer:** xxx", "**ANSWER:** xxx"
+  const answerMatch = response.match(/\*{0,2}answer\*{0,2}:\s*([\s\S]*)/i);
+  let answer = "";
+  
+  if (answerMatch) {
+    answer = answerMatch[1].trim();
+    // 清理可能的 markdown 格式残留
+    answer = answer.replace(/^\*+|\*+$/g, "").trim();
+  } else if (!hasSufficient) {
+    // 如果没有 SUFFICIENT 也没有 ANSWER 格式，整个响应可能就是答案
+    // 这种情况假设模型直接给出了答案，视为 sufficient
+    answer = response.trim();
+    return { sufficient: true, answer };
+  }
+  
+  return { sufficient: isSufficient, answer };
 }
 
 // ==================== UI 更新 ====================
@@ -449,7 +485,7 @@ function fetchPageContents() {
               hasCachedSummary: !!cachedSummary
             });
 
-            console.log(`[Popup] Tab loaded: ${tab.title}, has cached summary: ${!!cachedSummary}`);
+            console.log(`[Popup] Tab loaded: ${tab.title}, has cached summary: ${!!cachedSummary},cached summaries: ${cachedSummary?.summary}`);
           });
 
           port.onDisconnect.addListener(() => {
