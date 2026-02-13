@@ -307,7 +307,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case "ENGINE_INIT_PROGRESS":
       engineInitProgress = message.data.progress;
-      console.log("[Background] Engine progress:", Math.round(engineInitProgress * 100) + "%");
+      // console.log("[Background] Engine progress:", Math.round(engineInitProgress * 100) + "%");
       sendResponse({ status: "acknowledged" });
       return true;
 
@@ -358,14 +358,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       engineInitProgress = 0;
       isEngineInitializing = true;  // Set IMMEDIATELY to prevent race with INIT_ENGINE_REQUEST
       
-      // Save to storage (fire and forget) and initialize engine
+      // Save to storage (fire and forget)
       saveModelIdToStorage(newModelId).catch(err => 
         console.error("[Background] Failed to save model ID:", err)
       );
       
-      initializeEngine(newModelId).then((result) => {
-        sendResponse({ success: result.status !== "error", status: result.status, modelId: result.modelId, error: result.error });
-      });
+      // 立即返回响应，让 popup 可以开始轮询进度
+      sendResponse({ success: true, status: "loading", modelId: newModelId });
+      
+      // 异步初始化引擎（不等待完成）
+      initializeEngine(newModelId).catch(err => 
+        console.error("[Background] Engine init failed:", err)
+      );
       return true;
     }
 

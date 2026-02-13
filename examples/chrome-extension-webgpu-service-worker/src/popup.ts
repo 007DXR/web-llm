@@ -137,7 +137,9 @@ function showSettingsPage() {
   chatPage.style.display = "none";
   settingsPage.style.display = "block";
   settingsStatus.textContent = "";
-  saveSettingsButton.disabled = false;
+  
+  // Disable save button if engine is not ready
+  saveSettingsButton.disabled = isLoadingParams;
   
   // Get current model and populate select
   chrome.runtime.sendMessage({ type: "GET_SAVED_MODEL_ID" }, (response) => {
@@ -186,12 +188,10 @@ async function saveSettings() {
         isLoadingParams = true;
         submitButton.disabled = true;
         
-        // Recreate loading bar if needed
-        let loadingContainer = document.getElementById("loadingContainer");
-        if (!loadingContainer) {
-          loadingContainer = document.createElement("div");
-          loadingContainer.id = "loadingContainer";
-          chatPage.insertBefore(loadingContainer, chatPage.firstChild);
+        // Show loading bar
+        const loadingContainer = document.getElementById("loadingContainer");
+        if (loadingContainer) {
+          loadingContainer.style.display = "block";
         }
         
         // Wait for new engine (不需要再调用 initializeEngine，CHANGE_MODEL 已触发)
@@ -245,32 +245,6 @@ async function checkEngineStatus(): Promise<{ ready: boolean; progress: number; 
   });
 }
 
-interface EngineInitResponse {
-  status: "ready" | "initializing" | "error" | "already_ready" | "already_initializing";
-  modelId?: string;
-  error?: string;
-}
-
-async function initializeEngine(): Promise<EngineInitResponse> {
-  const timeout = 60000; // 60秒超时
-  
-  return new Promise((resolve) => {
-    const timeoutId = setTimeout(() => {
-      console.warn("[Popup] initializeEngine timeout");
-      resolve({ status: "error", error: "Request timeout" });
-    }, timeout);
-
-    chrome.runtime.sendMessage({ type: "INIT_ENGINE_REQUEST" }, (response) => {
-      clearTimeout(timeoutId);
-      if (chrome.runtime.lastError) {
-        console.warn("[Popup] Error initializing engine:", chrome.runtime.lastError);
-        resolve({ status: "error", error: chrome.runtime.lastError.message });
-      } else {
-        resolve(response || { status: "error", error: "No response" });
-      }
-    });
-  });
-}
 
 // 仅轮询等待引擎就绪（不触发初始化，用于已知正在初始化的场景）
 async function waitForEngineReady(): Promise<void> {
@@ -303,7 +277,7 @@ function enableInputs() {
     submitButton.disabled = false;
     const loadingBarContainer = document.getElementById("loadingContainer");
     if (loadingBarContainer) {
-      loadingBarContainer.remove();
+      loadingBarContainer.style.display = "none";
     }
     queryInput.focus();
     isLoadingParams = false;

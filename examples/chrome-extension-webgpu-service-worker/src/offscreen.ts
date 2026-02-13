@@ -72,7 +72,11 @@ async function initEngine(modelId: string = "Llama-3.2-1B-Instruct-q4f16_1-MLC")
     engine = await CreateMLCEngine(modelId, {
       initProgressCallback: (report) => {
         const progress = report.progress;
-        console.log("[Offscreen] Engine init progress:", Math.round(progress * 100) + "%");
+        // report.text 包含阶段信息，例如：
+        // "Loading model from cache[1/2]: ..." (加载配置/tokenizer)
+        // "Loading model from cache[2/2]: ..." (加载权重)
+        // 或 "Fetching param cache[1/x]: ..." (下载时)
+        console.log("[Offscreen] Engine init progress:", Math.round(progress * 100) + "%", "-", report.text);
         
         // 通知 background 进度
         chrome.runtime.sendMessage({
