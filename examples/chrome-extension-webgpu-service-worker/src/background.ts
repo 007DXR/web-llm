@@ -38,7 +38,7 @@ interface StreamChunk {
 }
 
 interface EngineInitResult {
-  status: "ready" | "initializing" | "error" | "already_ready" | "already_initializing";
+  status: "ready" | "initializing" | "error" ;
   modelId: string;
   error?: string;
 }
@@ -47,7 +47,7 @@ interface EngineInitResult {
 
 const SUMMARY_CACHE_PREFIX = "page_summary_";
 const PENDING_CACHE_PREFIX = "pending_page_";
-const DEFAULT_MODEL_ID = "Llama-3.2-3B-Instruct-q4f32_1-MLC";
+const DEFAULT_MODEL_ID = "Qwen3-1.7B-q4f16_1" //"Llama-3.2-1B-Instruct-q4f16_1-MLC"// "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 const MODEL_STORAGE_KEY = "selected_model_id";
 
 let currentModelId = DEFAULT_MODEL_ID;
@@ -126,13 +126,13 @@ async function initializeEngine(forceModelId?: string): Promise<EngineInitResult
   const modelId = forceModelId || currentModelId;
   
   if (offscreenEngineReady && !forceModelId) {
-    return { status: "already_ready", modelId };
+    return { status: "ready", modelId };
   }
 
   // 如果已经在初始化相同的模型，直接返回
   if (isEngineInitializing && !forceModelId) {
     console.log("[Background] Engine already initializing, skipping duplicate request");
-    return { status: "already_initializing", modelId };
+    return { status: "initializing", modelId };
   }
 
   const created = await ensureOffscreenDocument();
@@ -478,12 +478,16 @@ chrome.runtime.onConnect.addListener((port) => {
 
 // ==================== 初始化 ====================
 
-// 启动时加载保存的模型 ID 并创建 offscreen document
+// 启动时加载保存的模型 ID 并创建 offscreen document，然后开始初始化引擎
 loadModelIdFromStorage().then(savedModelId => {
   currentModelId = savedModelId;
   console.log("[Background] Loaded model ID from storage:", currentModelId);
   
   ensureOffscreenDocument().then(() => {
-    console.log("[Background] Initialization complete");
+    console.log("[Background] Offscreen document ready, starting engine initialization...");
+    // 启动时就开始加载模型，不等 popup 触发
+    initializeEngine().then(result => {
+      console.log("[Background] Initial engine load result:", result.status);
+    });
   });
 });

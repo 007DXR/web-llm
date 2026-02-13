@@ -271,6 +271,7 @@ p {
 
 /* SETTINGS PAGE */
 #settings-page {
+  display: none;
   padding: 0.5rem;
 }
 

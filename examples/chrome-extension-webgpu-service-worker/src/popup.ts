@@ -137,6 +137,7 @@ function showSettingsPage() {
   chatPage.style.display = "none";
   settingsPage.style.display = "block";
   settingsStatus.textContent = "";
+  saveSettingsButton.disabled = false;
   
   // Get current model and populate select
   chrome.runtime.sendMessage({ type: "GET_SAVED_MODEL_ID" }, (response) => {
@@ -193,8 +194,8 @@ async function saveSettings() {
           chatPage.insertBefore(loadingContainer, chatPage.firstChild);
         }
         
-        // Wait for new engine
-        waitForEngine().then(() => {
+        // Wait for new engine (不需要再调用 initializeEngine，CHANGE_MODEL 已触发)
+        waitForEngineReady().then(() => {
           console.log("[Popup] New model loaded successfully");
         }).catch(err => {
           console.error("[Popup] Failed to load new model:", err);
@@ -244,25 +245,38 @@ async function checkEngineStatus(): Promise<{ ready: boolean; progress: number; 
   });
 }
 
-async function initializeEngine(): Promise<void> {
+interface EngineInitResponse {
+  status: "ready" | "initializing" | "error" | "already_ready" | "already_initializing";
+  modelId?: string;
+  error?: string;
+}
+
+async function initializeEngine(): Promise<EngineInitResponse> {
+  const timeout = 60000; // 60秒超时
+  
   return new Promise((resolve) => {
+    const timeoutId = setTimeout(() => {
+      console.warn("[Popup] initializeEngine timeout");
+      resolve({ status: "error", error: "Request timeout" });
+    }, timeout);
+
     chrome.runtime.sendMessage({ type: "INIT_ENGINE_REQUEST" }, (response) => {
+      clearTimeout(timeoutId);
       if (chrome.runtime.lastError) {
         console.warn("[Popup] Error initializing engine:", chrome.runtime.lastError);
+        resolve({ status: "error", error: chrome.runtime.lastError.message });
+      } else {
+        resolve(response || { status: "error", error: "No response" });
       }
-      resolve();
     });
   });
 }
 
-// 轮询检查引擎状态
-async function waitForEngine(): Promise<void> {
+// 仅轮询等待引擎就绪（不触发初始化，用于已知正在初始化的场景）
+async function waitForEngineReady(): Promise<void> {
   const checkInterval = 500;
   const maxWaitTime = 120000; // 2分钟超时
   const startTime = Date.now();
-
-  // 先请求初始化
-  await initializeEngine();
 
   return new Promise((resolve, reject) => {
     const check = async () => {
@@ -497,6 +511,8 @@ async function handleClick() {
     await sendStreamingChat(finalMessages);
   } catch (err) {
     console.error("[Popup] Chat error:", err);
+    document.getElementById("loading-indicator")!.style.display = "none";
+    document.getElementById("answerWrapper")!.style.display = "block";
     document.getElementById("answer")!.innerHTML = `Error: ${err}`;
   }
 }
@@ -669,7 +685,7 @@ async function init() {
 
   // 等待引擎就绪
   try {
-    await waitForEngine();
+    await waitForEngineReady();
     console.log("[Popup] Engine ready, UI enabled");
   } catch (err) {
     console.error("[Popup] Engine initialization failed:", err);
