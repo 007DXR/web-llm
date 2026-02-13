@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * Popup - 用户界面层
+ * Sidebar - 用户界面层
  * 
  * 职责：
  * - 用户输入/输出
@@ -12,7 +12,7 @@
 // This code is partially adapted from the openai-chatgpt-chrome-extension repo:
 // https://github.com/jessedi0n/openai-chatgpt-chrome-extension
 
-import "./popup.css";
+import "./sidebar.css";
 import { ProgressBar, Line } from "progressbar.js";
 import { prebuiltAppConfig, ModelRecord } from "@mlc-ai/web-llm";
 
@@ -50,7 +50,7 @@ interface StreamChunk {
 // ==================== 配置 ====================
 
 const useContext = true;
-console.log("[Popup] useContext:", useContext);
+console.log("[Sidebar] useContext:", useContext);
 
 // ==================== Model Configuration ====================
 
@@ -196,9 +196,9 @@ async function saveSettings() {
         
         // Wait for new engine (不需要再调用 initializeEngine，CHANGE_MODEL 已触发)
         waitForEngineReady().then(() => {
-          console.log("[Popup] New model loaded successfully");
+          console.log("[Sidebar] New model loaded successfully");
         }).catch(err => {
-          console.error("[Popup] Failed to load new model:", err);
+          console.error("[Sidebar] Failed to load new model:", err);
         });
       }
     } else {
@@ -231,7 +231,7 @@ async function checkEngineStatus(): Promise<{ ready: boolean; progress: number; 
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: "GET_ENGINE_STATUS" }, (response) => {
       if (chrome.runtime.lastError) {
-        console.warn("[Popup] Error checking engine status:", chrome.runtime.lastError);
+        console.warn("[Sidebar] Error checking engine status:", chrome.runtime.lastError);
         resolve({ ready: false, progress: 0 });
       } else {
         // Update current model display
@@ -315,7 +315,7 @@ async function sendStreamingChat(messages: ChatMessage[], updateUI: boolean = tr
           port.disconnect();
         }
       } else if (message.type === "status") {
-        console.log("[Popup] Engine status:", message.status, message.progress);
+        console.log("[Sidebar] Engine status:", message.status, message.progress);
       } else if (message.type === "error") {
         reject(new Error(message.error));
         port.disconnect();
@@ -354,186 +354,48 @@ submitButton.addEventListener("click", handleClick);
 
 async function handleClick() {
   const message = queryInput.value;
-  console.log("[Popup] User message:", message);
+  console.log("[Sidebar] User message:", message);
 
   // 重置 UI
   document.getElementById("answer")!.innerHTML = "";
   document.getElementById("answerWrapper")!.style.display = "none";
   document.getElementById("loading-indicator")!.style.display = "block";
 
-  let finalMessages: ChatMessage[] = [];
-
-  // 检查是否有多个标签页
-  if (allTabContents.length > 1) {
-    console.log(`[Popup] Processing ${allTabContents.length} tabs...`);
-
-    // Phase 1: 对每个标签页，使用摘要或原始内容回答问题
-    const compressedTabContents: { 
-      title: string; 
-      url: string; 
-      compressed: string; 
-      isRelevant: boolean 
-    }[] = [];
-
-    for (let i = 0; i < allTabContents.length; i++) {
-      const tabInfo = allTabContents[i];
-      console.log(`[Popup] Processing tab ${i + 1}/${allTabContents.length}: ${tabInfo.title}`);
-
-      let compressedContent = "";
-      let isRelevant = true;
-
-      if (tabInfo.hasCachedSummary && tabInfo.cachedSummary) {
-        // 使用缓存的摘要
-        console.log(`[Popup] Using cached summary for: ${tabInfo.title}`);
-        
-        const summaryMessages: ChatMessage[] = [
-          {
-            role: "system",
-            content: "Answer the question based on the summary. You MUST use this EXACT format (no markdown, no asterisks):\nSUFFICIENT: yes\nANSWER: your answer\n\nOR if info not found:\nSUFFICIENT: no\nANSWER: N/A\n\nBe concise. No extra text."
-          },
-          {
-            role: "user",
-            content: `SUMMARY: ${tabInfo.cachedSummary}\n\nQUESTION: ${message}`
-          }
-        ];
-
-        try {
-          // 使用静默模式，不更新 UI
-          const summaryResponse = await sendStreamingChat(summaryMessages, false);
-          
-          // 解析响应 - 更健壮的解析逻辑
-          const parsedResult = parseSummaryResponse(summaryResponse);
-          
-          if (parsedResult.sufficient) {
-            compressedContent = parsedResult.answer;
-            isRelevant = !compressedContent.toLowerCase().includes("no relevant information") &&
-                         compressedContent.toLowerCase() !== "n/a" &&
-                         compressedContent.trim() !== "";
-          } else {
-            // 摘要不够，使用原始内容（静默模式）
-            compressedContent = await answerFromContent(tabInfo.content, message);
-            isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
-          }
-        } catch (err) {
-          console.error(`[Popup] Error processing tab ${tabInfo.title}:`, err);
-          compressedContent = "Error processing this tab";
-          isRelevant = false;
-        }
-      } else {
-        // 无缓存摘要，直接使用原始内容（静默模式）
-        console.log(`[Popup] No cached summary for: ${tabInfo.title}`);
-        try {
-          compressedContent = await answerFromContent(tabInfo.content, message);
-          isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
-        } catch (err) {
-          console.error(`[Popup] Error processing tab ${tabInfo.title}:`, err);
-          compressedContent = "Error processing this tab";
-          isRelevant = false;
-        }
-      }
-
-      compressedTabContents.push({
-        title: tabInfo.title,
-        url: tabInfo.url,
-        compressed: compressedContent,
-        isRelevant: isRelevant
-      });
+  try {
+    // 调用 Background 处理多标签页查询逻辑
+    const result = await processMultiTabQueryViaBackground(allTabContents, message);
+    
+    if (!result.success) {
+      throw new Error(result.error || "Failed to process query");
     }
 
-    // Phase 2: 过滤相关标签页并组合
-    const relevantTabs = compressedTabContents.filter(tab => tab.isRelevant);
-    console.log(`[Popup] Found ${relevantTabs.length} relevant tabs`);
-
-    const combinedContext = relevantTabs
-      .map((tabInfo, index) =>
-        `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nRelevant Information: ${tabInfo.compressed}\n`
-      )
-      .join("\n");
-
-    finalMessages = [
-      {
-        role: "system",
-        content: relevantTabs.length > 0
-          ? `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open. Below is the relevant information extracted from ${relevantTabs.length} relevant tabs:\n\n${combinedContext}\n\nPlease provide a comprehensive answer.`
-          : `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open, but none contain relevant information. Please let the user know.`
-      },
-      { role: "user", content: message }
-    ];
-
-  } else {
-    // 单个标签页或无标签页
-    console.log("[Popup] Single tab or no tabs, using original logic...");
-    
-    const pageContext = allTabContents
-      .map((tabInfo, index) =>
-        `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\n\n${tabInfo.content}\n\n`
-      )
-      .join("\n");
-
-    finalMessages = [
-      {
-        role: "system",
-        content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage.`
-      },
-      { role: "user", content: message }
-    ];
-  }
-
-  console.log("[Popup] Sending final messages...");
-
-  try {
-    await sendStreamingChat(finalMessages);
+    // 发送最终消息进行 streaming 输出
+    await sendStreamingChat(result.finalMessages as ChatMessage[]);
   } catch (err) {
-    console.error("[Popup] Chat error:", err);
+    console.error("[Sidebar] Chat error:", err);
     document.getElementById("loading-indicator")!.style.display = "none";
     document.getElementById("answerWrapper")!.style.display = "block";
     document.getElementById("answer")!.innerHTML = `Error: ${err}`;
   }
 }
 
-// 中间处理函数：使用静默模式，不更新 UI
-async function answerFromContent(content: string, question: string): Promise<string> {
-  const messages: ChatMessage[] = [
-    {
-      role: "system",
-      content: "Answer the question based on the provided content. Format: Concise bullet points. If the content doesn't contain relevant information, say 'No relevant information'. No conversational filler."
-    },
-    {
-      role: "user",
-      content: `CONTENT: ${content.substring(0, 8000)}\nQUESTION: ${question}\nANSWER:`
-    }
-  ];
-
-  return sendStreamingChat(messages, false);
-}
-
-// 解析摘要响应 - 处理各种格式变体
-function parseSummaryResponse(response: string): { sufficient: boolean; answer: string } {
-  const normalized = response.toLowerCase();
-  
-  // 检查 SUFFICIENT - 支持多种格式：
-  // "SUFFICIENT: yes", "**Sufficient:** yes", "sufficient:yes"
-  const sufficientMatch = normalized.match(/\*{0,2}sufficient\*{0,2}:\s*(yes|no)/i);
-  const hasSufficient = sufficientMatch !== null;
-  const isSufficient = sufficientMatch ? sufficientMatch[1] === "yes" : false;
-  
-  // 提取 ANSWER - 支持多种格式：
-  // "ANSWER: xxx", "**Answer:** xxx", "**ANSWER:** xxx"
-  const answerMatch = response.match(/\*{0,2}answer\*{0,2}:\s*([\s\S]*)/i);
-  let answer = "";
-  
-  if (answerMatch) {
-    answer = answerMatch[1].trim();
-    // 清理可能的 markdown 格式残留
-    answer = answer.replace(/^\*+|\*+$/g, "").trim();
-  } else if (!hasSufficient) {
-    // 如果没有 SUFFICIENT 也没有 ANSWER 格式，整个响应可能就是答案
-    // 这种情况假设模型直接给出了答案，视为 sufficient
-    answer = response.trim();
-    return { sufficient: true, answer };
-  }
-  
-  return { sufficient: isSufficient, answer };
+// 调用 Background 处理多标签页查询
+async function processMultiTabQueryViaBackground(
+  tabContents: TabContent[],
+  userMessage: string
+): Promise<{ success: boolean; finalMessages?: ChatMessage[]; error?: string }> {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({
+      type: "PROCESS_MULTI_TAB_QUERY",
+      data: { tabContents, userMessage }
+    }, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({ success: false, error: chrome.runtime.lastError.message });
+      } else {
+        resolve(response || { success: false, error: "No response" });
+      }
+    });
+  });
 }
 
 // ==================== UI 更新 ====================
@@ -548,8 +410,8 @@ function updateAnswer(answer: string) {
   if (copyButton) {
     copyButton.onclick = () => {
       navigator.clipboard.writeText(answer)
-        .then(() => console.log("[Popup] Answer copied"))
-        .catch((err) => console.error("[Popup] Copy error:", err));
+        .then(() => console.log("[Sidebar] Answer copied"))
+        .catch((err) => console.error("[Sidebar] Copy error:", err));
     };
   }
 
@@ -576,7 +438,7 @@ async function getCachedSummary(url: string): Promise<CachedSummaryData | null> 
       { type: "GET_CACHED_SUMMARY", data: { url } },
       (response) => {
         if (chrome.runtime.lastError) {
-          console.warn("[Popup] Error getting cached summary:", chrome.runtime.lastError);
+          console.warn("[Sidebar] Error getting cached summary:", chrome.runtime.lastError);
           resolve(null);
         } else {
           resolve(response?.summary || null);
@@ -592,7 +454,7 @@ async function getAllCachedSummaries(): Promise<{ [url: string]: CachedSummaryDa
       { type: "GET_ALL_CACHED_SUMMARIES" },
       (response) => {
         if (chrome.runtime.lastError) {
-          console.warn("[Popup] Error getting cached summaries:", chrome.runtime.lastError);
+          console.warn("[Sidebar] Error getting cached summaries:", chrome.runtime.lastError);
           resolve({});
         } else {
           resolve(response?.summaries || {});
@@ -605,13 +467,13 @@ async function getAllCachedSummaries(): Promise<{ [url: string]: CachedSummaryDa
 function fetchPageContents() {
   chrome.tabs.query({ currentWindow: true }, async (tabs) => {
     if (tabs.length === 0) {
-      console.warn("[Popup] No tabs found");
+      console.warn("[Sidebar] No tabs found");
       return;
     }
 
     // 获取所有缓存摘要
     const cachedSummaries = await getAllCachedSummaries();
-    console.log(`[Popup] Found ${Object.keys(cachedSummaries).length} cached summaries`);
+    console.log(`[Sidebar] Found ${Object.keys(cachedSummaries).length} cached summaries`);
 
     tabs.forEach((tab) => {
       if (tab.id) {
@@ -631,16 +493,16 @@ function fetchPageContents() {
               hasCachedSummary: !!cachedSummary
             });
 
-            console.log(`[Popup] Tab loaded: ${tab.title}, has cached summary: ${!!cachedSummary},cached summaries: ${cachedSummary?.summary}`);
+            console.log(`[Sidebar] Tab loaded: ${tab.title}, has cached summary: ${!!cachedSummary},cached summaries: ${cachedSummary?.summary}`);
           });
 
           port.onDisconnect.addListener(() => {
             if (chrome.runtime.lastError) {
-              console.warn(`[Popup] Could not connect to tab ${tab.id}: ${chrome.runtime.lastError.message}`);
+              console.warn(`[Sidebar] Could not connect to tab ${tab.id}: ${chrome.runtime.lastError.message}`);
             }
           });
         } catch (error) {
-          console.warn(`[Popup] Failed to connect to tab ${tab.id}:`, error);
+          console.warn(`[Sidebar] Failed to connect to tab ${tab.id}:`, error);
         }
       }
     });
@@ -650,7 +512,7 @@ function fetchPageContents() {
 // ==================== 初始化 ====================
 
 async function init() {
-  console.log("[Popup] Initializing...");
+  console.log("[Sidebar] Initializing...");
   
   // 获取页面内容
   if (useContext) {
@@ -660,9 +522,9 @@ async function init() {
   // 等待引擎就绪
   try {
     await waitForEngineReady();
-    console.log("[Popup] Engine ready, UI enabled");
+    console.log("[Sidebar] Engine ready, UI enabled");
   } catch (err) {
-    console.error("[Popup] Engine initialization failed:", err);
+    console.error("[Sidebar] Engine initialization failed:", err);
     document.getElementById("answer")!.innerHTML = "Engine initialization failed. Please reload the extension.";
   }
 }

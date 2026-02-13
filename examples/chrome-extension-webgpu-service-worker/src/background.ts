@@ -206,6 +206,204 @@ async function removePendingPage(url: string): Promise<void> {
   await chrome.storage.local.remove(cacheKey);
 }
 
+// ==================== 多标签页处理逻辑 ====================
+
+interface TabContentInfo {
+  title: string;
+  url: string;
+  content: string;
+  cachedSummary?: string;
+  hasCachedSummary: boolean;
+}
+
+interface MultiTabQueryResult {
+  success: boolean;
+  finalMessages?: Array<{ role: string; content: string }>;
+  error?: string;
+}
+
+// 解析摘要响应 - 处理各种格式变体
+function parseSummaryResponse(response: string): { sufficient: boolean; answer: string } {
+  const normalized = response.toLowerCase();
+  
+  // 检查 SUFFICIENT - 支持多种格式
+  const sufficientMatch = normalized.match(/\*{0,2}sufficient\*{0,2}:\s*(yes|no)/i);
+  const hasSufficient = sufficientMatch !== null;
+  const isSufficient = sufficientMatch ? sufficientMatch[1] === "yes" : false;
+  
+  // 提取 ANSWER
+  const answerMatch = response.match(/\*{0,2}answer\*{0,2}:\s*([\s\S]*)/i);
+  let answer = "";
+  
+  if (answerMatch) {
+    answer = answerMatch[1].trim();
+    answer = answer.replace(/^\*+|\*+$/g, "").trim();
+  } else if (!hasSufficient) {
+    answer = response.trim();
+    return { sufficient: true, answer };
+  }
+  
+  return { sufficient: isSufficient, answer };
+}
+
+// 调用 offscreen 进行静默 chat（中间处理，不更新 UI）
+async function silentChat(messages: Array<{ role: string; content: string }>): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const requestId = `silent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    chrome.runtime.sendMessage({
+      type: "CHAT_COMPLETION",
+      data: { requestId, messages }
+    }, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else if (response?.success) {
+        resolve(response.content || "");
+      } else {
+        reject(new Error(response?.error || "Unknown error"));
+      }
+    });
+  });
+}
+
+// 从内容中回答问题
+async function answerFromContent(content: string, question: string): Promise<string> {
+  const messages = [
+    {
+      role: "system",
+      content: "Answer the question based on the provided content. Format: Concise bullet points. If the content doesn't contain relevant information, say 'No relevant information'. No conversational filler."
+    },
+    {
+      role: "user",
+      content: `CONTENT: ${content.substring(0, CONFIG.maxContentLength)}\nQUESTION: ${question}\nANSWER:`
+    }
+  ];
+  
+  return silentChat(messages);
+}
+
+// 处理多标签页查询 - 核心逻辑
+async function processMultiTabQuery(
+  allTabContents: TabContentInfo[],
+  userMessage: string
+): Promise<MultiTabQueryResult> {
+  
+  if (allTabContents.length <= 1) {
+    // 单个标签页或无标签页，使用简单逻辑
+    const pageContext = allTabContents
+      .map((tabInfo, index) =>
+        `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\n\n${tabInfo.content}\n\n`
+      )
+      .join("\n");
+
+    return {
+      success: true,
+      finalMessages: [
+        {
+          role: "system",
+          content: `You are a helpful assistant. Here is the content of the browser tab:\n\n${pageContext}\n\nPlease answer questions about this webpage.`
+        },
+        { role: "user", content: userMessage }
+      ]
+    };
+  }
+
+  console.log(`[Background] Processing ${allTabContents.length} tabs...`);
+
+  // Phase 1: 对每个标签页，使用摘要或原始内容回答问题
+  const compressedTabContents: { 
+    title: string; 
+    url: string; 
+    compressed: string; 
+    isRelevant: boolean 
+  }[] = [];
+
+  for (let i = 0; i < allTabContents.length; i++) {
+    const tabInfo = allTabContents[i];
+    console.log(`[Background] Processing tab ${i + 1}/${allTabContents.length}: ${tabInfo.title}`);
+
+    let compressedContent = "";
+    let isRelevant = true;
+
+    if (tabInfo.hasCachedSummary && tabInfo.cachedSummary) {
+      // 使用缓存的摘要
+      console.log(`[Background] Using cached summary for: ${tabInfo.title}`);
+      
+      const summaryMessages = [
+        {
+          role: "system",
+          content: "Answer the question based on the summary. You MUST use this EXACT format (no markdown, no asterisks):\nSUFFICIENT: yes\nANSWER: your answer\n\nOR if info not found:\nSUFFICIENT: no\nANSWER: N/A\n\nBe concise. No extra text."
+        },
+        {
+          role: "user",
+          content: `SUMMARY: ${tabInfo.cachedSummary}\n\nQUESTION: ${userMessage}`
+        }
+      ];
+
+      try {
+        const summaryResponse = await silentChat(summaryMessages);
+        const parsedResult = parseSummaryResponse(summaryResponse);
+        
+        if (parsedResult.sufficient) {
+          compressedContent = parsedResult.answer;
+          isRelevant = !compressedContent.toLowerCase().includes("no relevant information") &&
+                       compressedContent.toLowerCase() !== "n/a" &&
+                       compressedContent.trim() !== "";
+        } else {
+          // 摘要不够，使用原始内容
+          compressedContent = await answerFromContent(tabInfo.content, userMessage);
+          isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
+        }
+      } catch (err) {
+        console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
+        compressedContent = "Error processing this tab";
+        isRelevant = false;
+      }
+    } else {
+      // 无缓存摘要，直接使用原始内容
+      console.log(`[Background] No cached summary for: ${tabInfo.title}`);
+      try {
+        compressedContent = await answerFromContent(tabInfo.content, userMessage);
+        isRelevant = !compressedContent.toLowerCase().includes("no relevant information");
+      } catch (err) {
+        console.error(`[Background] Error processing tab ${tabInfo.title}:`, err);
+        compressedContent = "Error processing this tab";
+        isRelevant = false;
+      }
+    }
+
+    compressedTabContents.push({
+      title: tabInfo.title,
+      url: tabInfo.url,
+      compressed: compressedContent,
+      isRelevant: isRelevant
+    });
+  }
+
+  // Phase 2: 过滤相关标签页并组合
+  const relevantTabs = compressedTabContents.filter(tab => tab.isRelevant);
+  console.log(`[Background] Found ${relevantTabs.length} relevant tabs`);
+
+  const combinedContext = relevantTabs
+    .map((tabInfo, index) =>
+      `=== Tab ${index + 1}: ${tabInfo.title} ===\nURL: ${tabInfo.url}\nRelevant Information: ${tabInfo.compressed}\n`
+    )
+    .join("\n");
+
+  return {
+    success: true,
+    finalMessages: [
+      {
+        role: "system",
+        content: relevantTabs.length > 0
+          ? `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open. Below is the relevant information extracted from ${relevantTabs.length} relevant tabs:\n\n${combinedContext}\n\nPlease provide a comprehensive answer.`
+          : `You are a helpful assistant. The user has ${allTabContents.length} browser tabs open, but none contain relevant information. Please let the user know.`
+      },
+      { role: "user", content: userMessage }
+    ]
+  };
+}
+
 // ==================== 摘要队列处理 ====================
 
 async function processSummarizationQueue() {
@@ -413,6 +611,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       return true;
 
+    // ==================== 多标签页处理 ====================
+    case "PROCESS_MULTI_TAB_QUERY": {
+      const { tabContents, userMessage } = message.data;
+      
+      // 确保引擎就绪
+      if (!offscreenEngineReady) {
+        sendResponse({ success: false, error: "Engine not ready" });
+        return true;
+      }
+      
+      processMultiTabQuery(tabContents, userMessage)
+        .then(result => sendResponse(result))
+        .catch(err => sendResponse({ success: false, error: String(err) }));
+      return true;
+    }
+
     default:
       return false;
   }
@@ -481,6 +695,9 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 // ==================== 初始化 ====================
+
+// 设置点击扩展图标时打开侧边栏
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
 // 启动时加载保存的模型 ID 并创建 offscreen document，然后开始初始化引擎
 loadModelIdFromStorage().then(savedModelId => {
